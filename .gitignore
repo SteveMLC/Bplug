@@ -27,3 +27,6 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Packaging
+blender_pet_optimizer.zip

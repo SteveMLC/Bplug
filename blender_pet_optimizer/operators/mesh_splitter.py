@@ -553,20 +553,20 @@ class PET_OT_split_by_vertex_groups(Operator):
                     # If no new object was created, the selection might have failed
                     self.report({'WARNING'}, f"Failed to split vertex group: {vg.name} - no new object created")
             
-        # Create pivot points using pre-calculated positions (BEFORE deleting original)
-        if self.create_pivots and attachment_points and created_objects:
-            pivots = self.create_pivot_points_from_attachments(obj, created_objects, attachment_points)
-            all_pivots.extend(pivots)
-        
-        # Optionally delete original object (AFTER creating pivots)
-        original_obj_name = obj.name  # Store name before deletion
-        if not self.keep_original and created_objects:
-            # Only delete if we successfully created split objects
-            try:
-                bpy.data.objects.remove(obj, do_unlink=True)
-                obj = None  # Mark as deleted
-            except Exception as e:
-                self.report({'WARNING'}, f"Could not delete original object: {str(e)}")
+            # Create pivot points using pre-calculated positions (BEFORE deleting original)
+            if self.create_pivots and attachment_points and created_objects:
+                pivots = self.create_pivot_points_from_attachments(obj, created_objects, attachment_points)
+                all_pivots.extend(pivots)
+            
+            # Optionally delete original object (AFTER creating pivots)
+            original_obj_name = obj.name  # Store name before deletion
+            if not self.keep_original and created_objects:
+                # Only delete if we successfully created split objects
+                try:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                    obj = None  # Mark as deleted
+                except Exception as e:
+                    self.report({'WARNING'}, f"Could not delete original object: {str(e)}")
             
             # Report results
             result_msg = f"Split into {len(created_objects)} objects"
@@ -639,9 +639,12 @@ class PET_OT_split_by_vertex_groups(Operator):
                 pivot["pet_target_part"] = g2
                 pivot["pet_original_mesh"] = original_obj.name
                 
-                # Link to pivot collection
+                # Link to pivot collection, then unlink from current collection(s)
                 pivot_collection.objects.link(pivot)
-                bpy.context.scene.collection.objects.unlink(pivot)
+                # Unlink from all collections the pivot is currently in (except our pivot collection)
+                for collection in list(pivot.users_collection):  # Use list() to avoid modifying while iterating
+                    if collection != pivot_collection:
+                        collection.objects.unlink(pivot)
                 
                 pivots.append(pivot)
         
@@ -695,9 +698,12 @@ class PET_OT_split_by_vertex_groups(Operator):
                     pivot["pet_target_part"] = obj2.name.split('_')[-1]
                     pivot["pet_original_mesh"] = original_obj.name
                     
-                    # Link to pivot collection
+                    # Link to pivot collection, then unlink from current collection(s)
                     pivot_collection.objects.link(pivot)
-                    bpy.context.scene.collection.objects.unlink(pivot)
+                    # Unlink from all collections the pivot is currently in (except our pivot collection)
+                    for collection in list(pivot.users_collection):  # Use list() to avoid modifying while iterating
+                        if collection != pivot_collection:
+                            collection.objects.unlink(pivot)
                     
                     pivots.append(pivot)
         
