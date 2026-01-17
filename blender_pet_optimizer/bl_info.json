@@ -1,0 +1,9 @@
+{
+    "name": "Pet Model Optimizer",
+    "author": "Your Name",
+    "version": [1, 0, 0],
+    "blender": [3, 0, 0],
+    "location": "View3D > N-Panel > Pet Model Optimizer",
+    "description": "Mesh optimization, segmentation, and rigging tools for organic animal models",
+    "category": "Mesh"
+}

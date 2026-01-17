@@ -1,0 +1,37 @@
+{
+    "naming_conventions": {
+        "vertex_groups": {
+            "head": "Head",
+            "body": "Body",
+            "leg_front_left": "Leg_L",
+            "leg_front_right": "Leg_R",
+            "leg_back_left": "Leg_L",
+            "leg_back_right": "Leg_R",
+            "tail": "Tail",
+            "wing_left": "Wing_L",
+            "wing_right": "Wing_R"
+        },
+        "objects": {
+            "pattern": "{AnimalType}_{PartName}",
+            "example": "Cat_Head"
+        },
+        "bones": {
+            "root": "Root",
+            "body": "Body",
+            "head": "Head",
+            "legs": "Leg_{Side}_{Index}",
+            "tail": "Tail_{Index}",
+            "wings": "Wing_{Side}_{Index}"
+        },
+        "attachments": {
+            "neck": "NeckAttachment",
+            "hip": "HipAttachment",
+            "root": "RootAttachment"
+        }
+    },
+    "roblox_compatibility": {
+        "note": "Naming conventions follow Roblox attachment naming standards",
+        "mesh_part_prefix": "",
+        "attachment_suffix": "Attachment"
+    }
+}
