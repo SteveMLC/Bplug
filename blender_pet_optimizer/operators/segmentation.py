@@ -89,6 +89,7 @@ class PET_OT_segment_model(Operator):
         clear_existing = settings.clear_existing if hasattr(settings, 'clear_existing') else self.clear_existing
         auto_split = settings.auto_split if hasattr(settings, 'auto_split') else self.auto_split
         use_fast_mode = settings.use_fast_mode if hasattr(settings, 'use_fast_mode') else False
+        invert_forward_axis = settings.invert_forward_axis if hasattr(settings, 'invert_forward_axis') else False
         
         # Get template for pet type
         template = segmentation_templates.TEMPLATES.get(pet_type)
@@ -137,7 +138,8 @@ class PET_OT_segment_model(Operator):
                     use_geometry_based=use_geometry_based,
                     template_type=pet_type,
                     use_fast_mode=use_fast_mode,
-                    timeout=5.0  # 5 second timeout for final segmentation
+                    timeout=5.0,  # 5 second timeout for final segmentation
+                    invert_forward_axis=invert_forward_axis
                 )
             except Exception as e:
                 print(f"WARNING: Segmentation failed ({str(e)}), falling back to spatial-only...")
@@ -150,7 +152,8 @@ class PET_OT_segment_model(Operator):
                     auto_detect_protrusions=False,
                     use_geometry_based=False,
                     template_type=pet_type,
-                    use_fast_mode=True
+                    use_fast_mode=True,
+                    invert_forward_axis=invert_forward_axis
                 )
             
             # Check elapsed time
@@ -267,6 +270,7 @@ class PET_OT_preview_segmentation(Operator):
         sensitivity = settings.sensitivity if hasattr(settings, 'sensitivity') else self.sensitivity
         clear_existing = settings.clear_existing if hasattr(settings, 'clear_existing') else self.clear_existing
         use_fast_mode = settings.use_fast_mode if hasattr(settings, 'use_fast_mode') else False
+        invert_forward_axis = settings.invert_forward_axis if hasattr(settings, 'invert_forward_axis') else False
         
         # Perform segmentation
         template = segmentation_templates.TEMPLATES.get(pet_type)
@@ -346,7 +350,8 @@ class PET_OT_preview_segmentation(Operator):
                             auto_detect_protrusions=effective_auto_detect,
                             use_geometry_based=True,
                             template_type=pet_type,
-                            use_fast_mode=use_fast_mode
+                            use_fast_mode=use_fast_mode,
+                            invert_forward_axis=invert_forward_axis
                         )
                         
                         # Check if we exceeded timeout

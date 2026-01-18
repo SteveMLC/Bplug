@@ -5,9 +5,37 @@ N-panel interface for all addon operations
 
 import bpy
 from bpy.types import Panel, PropertyGroup
-from bpy.props import EnumProperty, BoolProperty, FloatProperty, IntProperty
+from bpy.props import EnumProperty, BoolProperty, FloatProperty, IntProperty, StringProperty
 from ..utils import bmesh_helpers
 from ..config.animal_presets import get_preset_names
+
+
+# Part definitions for each pet type (for UI display)
+PART_DEFINITIONS = {
+    'quadruped': ['head', 'leg_front_l', 'leg_front_r', 'leg_back_l', 'leg_back_r', 'tail', 'body'],
+    'biped': ['head', 'arm_l', 'arm_r', 'leg_l', 'leg_r', 'tail', 'body'],
+    'flying': ['head', 'wing_l', 'wing_r', 'leg_front_l', 'leg_front_r', 'leg_back_l', 'leg_back_r', 'tail', 'body'],
+}
+
+
+def get_part_display_name(part_name):
+    """Get user-friendly display name for a part."""
+    display_names = {
+        'head': 'HEAD',
+        'leg_front_l': 'Front Left Leg',
+        'leg_front_r': 'Front Right Leg',
+        'leg_back_l': 'Back Left Leg',
+        'leg_back_r': 'Back Right Leg',
+        'leg_l': 'Left Leg',
+        'leg_r': 'Right Leg',
+        'arm_l': 'Left Arm',
+        'arm_r': 'Right Arm',
+        'wing_l': 'Left Wing',
+        'wing_r': 'Right Wing',
+        'tail': 'TAIL',
+        'body': 'BODY',
+    }
+    return display_names.get(part_name, part_name.upper())
 
 
 class PET_SegmentationSettings(PropertyGroup):
@@ -68,6 +96,12 @@ class PET_SegmentationSettings(PropertyGroup):
         description="Use faster algorithms for large meshes (skips expensive connectivity analysis). Recommended for meshes > 200k vertices.",
         default=False
     )
+    
+    invert_forward_axis: BoolProperty(
+        name="Invert Forward Axis",
+        description="Manually invert the forward axis if auto-detection gets head/tail reversed. Use this if head is detected as tail and vice versa.",
+        default=False
+    )
 
 
 class PET_ManualAssignmentState(PropertyGroup):
@@ -115,6 +149,43 @@ class PET_SymmetrySettings(PropertyGroup):
         default=0.05,
         min=0.001,
         max=1.0
+    )
+
+
+class PET_ManualPartSelectionState(PropertyGroup):
+    """PropertyGroup for manual part selection state stored on Scene"""
+    
+    is_active: BoolProperty(
+        name="Manual Part Selection Active",
+        description="Whether manual part selection mode is currently active",
+        default=False
+    )
+    
+    current_part: StringProperty(
+        name="Current Part",
+        description="Name of the part currently being assigned",
+        default=""
+    )
+    
+    current_part_index: IntProperty(
+        name="Current Part Index",
+        description="Index of current part in the part list",
+        default=0,
+        min=0
+    )
+    
+    total_parts: IntProperty(
+        name="Total Parts",
+        description="Total number of parts to assign",
+        default=0,
+        min=0
+    )
+    
+    current_selection_vertex_count: IntProperty(
+        name="Current Selection Vertex Count",
+        description="Number of vertices in current selection",
+        default=0,
+        min=0
     )
 
 
@@ -296,8 +367,9 @@ class PET_PT_segmentation(Panel):
             
             # Navigation
             nav_row = wizard_box.row()
-            prev_op = nav_row.operator("pet.previous_manual_part", text="◄ Previous")
-            prev_op.enabled = current_step_idx > 0
+            prev_row = nav_row.row()
+            prev_row.enabled = current_step_idx > 0
+            prev_op = prev_row.operator("pet.previous_manual_part", text="◄ Previous")
             
             if current_step_idx < total_steps - 1:
                 next_op = nav_row.operator("pet.next_manual_part", text="Next ►")
@@ -328,10 +400,17 @@ class PET_PT_segmentation(Panel):
         # Show description based on method
         if settings.use_geometry_based:
             method_box.label(text="Uses actual mesh shape for detection", icon='INFO')
-            method_box.label(text="• Head = Top front relative to body")
-            method_box.label(text="• Legs = Bottom front/back")
-            method_box.label(text="• Tail = Back of body")
+            method_box.label(text="• Head = Blocky/square shape at front")
+            method_box.label(text="• Legs = Cylindrical/squarish at bottom (pairs)")
+            method_box.label(text="• Tail = Elongated/thin at back")
+            method_box.label(text="• Horns = Top lateral (included with head)")
             method_box.label(text="(Slower, use after preview to refine)", icon='TIME')
+            
+            # Orientation override option
+            method_box.separator()
+            method_box.prop(settings, "invert_forward_axis", text="Invert Forward Axis (Manual Override)")
+            if settings.invert_forward_axis:
+                method_box.label(text="Forward axis inverted - head/tail swapped", icon='INFO')
         else:
             method_box.label(text="Spatial-Only: Uses bounding box percentages", icon='INFO')
             method_box.label(text="(Fast, reliable, works on all meshes)", icon='CHECKMARK')
@@ -877,6 +956,194 @@ class PET_PT_batch_operations(Panel):
         tip_box.label(text="5. Click 'Export All Models'")
 
 
+class PET_PT_manual_part_selection(Panel):
+    """Manual Part Selection panel - click-to-select with intelligent auto-selection"""
+    bl_label = "Manual Part Selection"
+    bl_idname = "PET_PT_manual_part_selection"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        
+        if not obj or obj.type != 'MESH':
+            layout.label(text="Select a mesh object", icon='INFO')
+            return
+        
+        state = context.scene.pet_manual_part_selection_state
+        settings = context.scene.pet_segmentation_settings
+        
+        # ===== Mode Status =====
+        if state.is_active:
+            # Manual Part Selection is ACTIVE
+            status_box = layout.box()
+            status_box.label(text="Manual Part Selection ACTIVE", icon='PLAY')
+            
+            # Get part list and completed parts
+            part_list = obj.get("pet_manual_part_list", [])
+            completed_parts = list(obj.get("pet_manual_completed_parts", []))
+            
+            # Progress indicator
+            completed_count = len(completed_parts)
+            total_count = len(part_list)
+            progress_text = f"Progress: {completed_count} of {total_count} parts completed"
+            status_box.label(text=progress_text, icon='TIME')
+            
+            layout.separator()
+            
+            # ===== Part List with Status =====
+            parts_box = layout.box()
+            parts_box.label(text="Parts to Assign:", icon='GROUP_VERTEX')
+            
+            for part_name in part_list:
+                row = parts_box.row(align=True)
+                
+                # Status indicator
+                if part_name in completed_parts:
+                    row.label(text="", icon='CHECKMARK')
+                elif part_name == state.current_part:
+                    row.label(text="", icon='FORWARD')
+                else:
+                    row.label(text="", icon='RADIOBUT_OFF')
+                
+                # Part name button
+                display_name = get_part_display_name(part_name)
+                
+                if part_name == state.current_part:
+                    # Current part - highlighted
+                    row.alert = True
+                    op = row.operator("pet.select_part_to_assign", text=display_name, icon='RESTRICT_SELECT_OFF')
+                    op.part_name = part_name
+                    row.alert = False
+                elif part_name in completed_parts:
+                    # Completed part - can edit
+                    op = row.operator("pet.edit_saved_part", text=display_name, icon='GREASEPENCIL')
+                    op.part_name = part_name
+                else:
+                    # Not started
+                    op = row.operator("pet.select_part_to_assign", text=display_name)
+                    op.part_name = part_name
+            
+            layout.separator()
+            
+            # ===== Current Part Actions =====
+            if state.current_part:
+                current_box = layout.box()
+                current_box.label(text=f"Currently Assigning: {get_part_display_name(state.current_part)}", icon='RESTRICT_SELECT_OFF')
+                
+                # Click to Select button
+                click_row = current_box.row()
+                click_row.scale_y = 1.5
+                click_op = click_row.operator("pet.click_to_assign_part", 
+                                              text=f"Click to Select {get_part_display_name(state.current_part)}", 
+                                              icon='EYEDROPPER')
+                click_op.part_type = state.current_part
+                
+                # Selection info
+                if state.current_selection_vertex_count > 0:
+                    current_box.label(text=f"Selected: {state.current_selection_vertex_count:,} vertices", icon='VERTEXSEL')
+                
+                current_box.separator()
+                
+                # Selection editing tools
+                current_box.label(text="Adjust Selection:", icon='MODIFIER')
+                
+                edit_row = current_box.row(align=True)
+                edit_row.operator("pet.grow_selection", text="Grow +")
+                edit_row.operator("pet.shrink_selection", text="Shrink -")
+                
+                edit_row2 = current_box.row(align=True)
+                edit_row2.operator("pet.smooth_selection_boundary", text="Smooth Boundary")
+                
+                current_box.separator()
+                
+                # Preview and Save buttons
+                action_row = current_box.row(align=True)
+                action_row.operator("pet.preview_current_selection", text="Preview", icon='HIDE_OFF')
+                
+                save_row = current_box.row()
+                save_row.scale_y = 1.3
+                save_row.operator("pet.save_part_selection", text="Save Part", icon='CHECKMARK')
+            
+            layout.separator()
+            
+            # ===== Body Assignment =====
+            body_box = layout.box()
+            body_box.label(text="Body Assignment", icon='MESH_CUBE')
+            body_box.operator("pet.assign_body_remaining", text="Assign Remaining to Body", icon='BRUSH_DATA')
+            
+            layout.separator()
+            
+            # ===== Preview All Parts =====
+            preview_box = layout.box()
+            preview_box.label(text="Preview & Review", icon='HIDE_OFF')
+            preview_box.operator("pet.preview_all_parts", text="Preview All Parts", icon='COLOR')
+            
+            layout.separator()
+            
+            # ===== Finish / Cancel =====
+            finish_box = layout.box()
+            finish_box.label(text="Complete Segmentation", icon='CHECKMARK')
+            
+            finish_row = finish_box.row()
+            finish_row.scale_y = 1.5
+            finish_row.operator("pet.finish_part_selection", text="Finish & Create Vertex Groups", icon='CHECKMARK')
+            
+            cancel_row = finish_box.row()
+            cancel_row.operator("pet.cancel_part_selection", text="Cancel", icon='X')
+            
+            layout.separator()
+            
+            # ===== Add Custom Part =====
+            custom_box = layout.box()
+            custom_box.label(text="Custom Parts", icon='ADD')
+            custom_box.operator("pet.add_custom_part", text="Add Custom Part", icon='ADD')
+            
+        else:
+            # Manual Part Selection is NOT active
+            intro_box = layout.box()
+            intro_box.label(text="Manual Part Selection", icon='BRUSH_DATA')
+            intro_box.label(text="Click-to-select with intelligent auto-selection")
+            intro_box.label(text="")
+            intro_box.label(text="Workflow:")
+            intro_box.label(text="1. Click 'Start' to begin")
+            intro_box.label(text="2. Select a part from the list")
+            intro_box.label(text="3. Click on model to auto-select")
+            intro_box.label(text="4. Adjust selection if needed")
+            intro_box.label(text="5. Save and move to next part")
+            intro_box.label(text="6. Finish when all parts done")
+            
+            layout.separator()
+            
+            # Pet type selector
+            layout.label(text="Pet Type:")
+            row = layout.row()
+            row.prop(settings, "pet_type", expand=True)
+            
+            layout.separator()
+            
+            # Start button
+            start_row = layout.row()
+            start_row.scale_y = 1.5
+            start_row.operator("pet.start_manual_part_selection", text="Start Manual Part Selection", icon='PLAY')
+            
+            layout.separator()
+            
+            # Info about existing vertex groups
+            if obj.vertex_groups:
+                info_box = layout.box()
+                info_box.label(text="Existing Vertex Groups:", icon='INFO')
+                for vg in obj.vertex_groups:
+                    info_box.label(text=f"  - {vg.name}")
+                info_box.label(text="")
+                info_box.label(text="Note: Starting will clear existing groups")
+                info_box.label(text="if 'Clear Existing Groups' is enabled")
+
+
 class PET_PT_manual_segment(Panel):
     """Simple manual segmentation panel - optimized for high-poly models"""
     bl_label = "Manual Segment"
@@ -1068,10 +1335,12 @@ classes = [
     PET_SegmentationSettings,
     PET_ManualAssignmentState,
     PET_SymmetrySettings,
+    PET_ManualPartSelectionState,
     PET_PT_main_panel,
     PET_PT_mesh_optimization,
     PET_PT_segmentation,
     PET_PT_symmetry,
+    PET_PT_manual_part_selection,
     PET_PT_manual_segment,
     PET_PT_edge_cut_segmentation,
     PET_PT_rigging,
@@ -1088,6 +1357,7 @@ def register():
     bpy.types.Scene.pet_segmentation_settings = bpy.props.PointerProperty(type=PET_SegmentationSettings)
     bpy.types.Scene.pet_manual_assignment_state = bpy.props.PointerProperty(type=PET_ManualAssignmentState)
     bpy.types.Scene.pet_symmetry_settings = bpy.props.PointerProperty(type=PET_SymmetrySettings)
+    bpy.types.Scene.pet_manual_part_selection_state = bpy.props.PointerProperty(type=PET_ManualPartSelectionState)
 
 def unregister():
     if hasattr(bpy.types.Scene, 'pet_segmentation_settings'):
@@ -1096,6 +1366,8 @@ def unregister():
         del bpy.types.Scene.pet_manual_assignment_state
     if hasattr(bpy.types.Scene, 'pet_symmetry_settings'):
         del bpy.types.Scene.pet_symmetry_settings
+    if hasattr(bpy.types.Scene, 'pet_manual_part_selection_state'):
+        del bpy.types.Scene.pet_manual_part_selection_state
     
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

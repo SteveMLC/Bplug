@@ -784,20 +784,221 @@ def detect_main_body(obj):
     return None
 
 
-def calculate_main_axis(obj, body_info):
+def detect_model_orientation(obj, body_info, protrusions=None, primary_axis=None, lateral_axis=None):
     """
-    Calculate the main axis (front/back direction) of the mesh
-    Uses the longest dimension in the horizontal plane (X-Z for Y-up, X-Y for Z-up)
+    Detect model orientation to determine forward direction (head location).
+    
+    Uses multiple heuristics to determine if head is at -Y or +Y:
+    1. Shape analysis: Find blocky protrusions (head candidates) vs elongated (tail candidates)
+    2. Size analysis: Head is typically LARGER than tail (15-35% of body)
+    3. Horn detection: Top lateral protrusions (+Z, lateral) indicate head region
+    4. Position analysis: Head protrudes at forward end, tail at backward end
+    5. Fallback: Vertex distribution (body mass typically in middle/back)
     
     Args:
         obj: Blender object with mesh data
         body_info: Result from detect_main_body()
+        protrusions: Optional list of protrusion dicts
+        primary_axis: Optional Vector for primary axis (if None, determined from body_size)
+        lateral_axis: Optional Vector for lateral axis (if None, determined from body_size)
         
     Returns:
         dict: {
-            'forward': Vector (normalized forward direction),
+            'head_direction': -1 or +1,  # -1 = head at -Y, +1 = head at +Y
+            'confidence': 0.0-1.0,
+            'reason': str,
+            'is_inverted': bool  # True if head is at -Y (inverted from standard)
+        }
+    """
+    if not body_info:
+        return {
+            'head_direction': 1,
+            'confidence': 0.5,
+            'reason': 'fallback_no_body_info',
+            'is_inverted': False
+        }
+    
+    body_center = body_info['center']
+    body_bounds = body_info['bounds']
+    body_size = body_bounds[1] - body_bounds[0]
+    
+    # Default axes for analysis
+    up = Vector((0, 0, 1))  # Z up
+    
+    # Determine primary horizontal axis (X or Y)
+    # Use provided axes if available, otherwise determine from body_size
+    if primary_axis is None or lateral_axis is None:
+        if abs(body_size.x) > abs(body_size.y):
+            # X is longer, Y is forward/back
+            primary_axis = Vector((0, 1, 0))
+            lateral_axis = Vector((1, 0, 0))
+        else:
+            # Y is longer, X is forward/back
+            primary_axis = Vector((1, 0, 0))
+            lateral_axis = Vector((0, 1, 0))
+    
+    # Initialize scores for each direction
+    # Positive score = head at positive direction, negative = head at negative direction
+    head_score = 0.0
+    confidence_factors = []
+    reasons = []
+    
+    if protrusions:
+        # Analyze protrusions at each end
+        positive_end_protrusions = []
+        negative_end_protrusions = []
+        top_lateral_protrusions = []  # Potential horns
+        
+        body_length = max(abs(body_size.dot(primary_axis.normalized())), 0.001)
+        body_height = max(abs(body_size.dot(up.normalized())), 0.001)
+        body_width = max(abs(body_size.dot(lateral_axis.normalized())), 0.001)
+        
+        for p in protrusions:
+            relative_pos = p['relative_position']
+            forward_component = relative_pos.dot(primary_axis)
+            vertical_component = relative_pos.dot(up)
+            lateral_component = relative_pos.dot(lateral_axis)
+            
+            norm_forward = forward_component / body_length
+            norm_vertical = vertical_component / body_height
+            norm_lateral = lateral_component / body_width
+            
+            # Categorize protrusions by position
+            if norm_forward > 0.2:
+                positive_end_protrusions.append(p)
+            elif norm_forward < -0.2:
+                negative_end_protrusions.append(p)
+            
+            # Check for horn-like protrusions (top + lateral)
+            if norm_vertical > 0.3 and abs(norm_lateral) > 0.2:
+                top_lateral_protrusions.append({
+                    'protrusion': p,
+                    'norm_forward': norm_forward
+                })
+        
+        # Heuristic 1: Shape analysis - blocky = head, elongated = tail
+        # Shape is the most reliable indicator, so give it higher weight
+        for p in positive_end_protrusions:
+            shape = analyze_protrusion_shape(p)
+            if shape['is_blocky'] and not shape['is_elongated']:
+                head_score += 3.0  # Increased weight: Blocky at positive end = head at positive
+                reasons.append('blocky_protrusion_at_positive')
+            elif shape['is_elongated'] and shape['length_ratio'] > 2.0:  # Lowered threshold from 2.5
+                head_score -= 2.0  # Increased weight: Elongated at positive end = tail at positive, head at negative
+                reasons.append('elongated_protrusion_at_positive')
+        
+        for p in negative_end_protrusions:
+            shape = analyze_protrusion_shape(p)
+            if shape['is_blocky'] and not shape['is_elongated']:
+                head_score -= 3.0  # Increased weight: Blocky at negative end = head at negative
+                reasons.append('blocky_protrusion_at_negative')
+            elif shape['is_elongated'] and shape['length_ratio'] > 2.0:  # Lowered threshold from 2.5
+                head_score += 2.0  # Increased weight: Elongated at negative end = tail at negative, head at positive
+                reasons.append('elongated_protrusion_at_negative')
+        
+        # Heuristic 2: Size analysis - head is typically LARGER than tail
+        # Lowered threshold from 1.3x to 1.2x to be less strict
+        positive_sizes = [p.get('size', 0) for p in positive_end_protrusions]
+        negative_sizes = [p.get('size', 0) for p in negative_end_protrusions]
+        
+        if positive_sizes and negative_sizes:
+            avg_positive_size = sum(positive_sizes) / len(positive_sizes)
+            avg_negative_size = sum(negative_sizes) / len(negative_sizes)
+            
+            if avg_positive_size > avg_negative_size * 1.2:  # Lowered from 1.3
+                head_score += 1.5  # Larger at positive = head at positive
+                reasons.append('larger_protrusion_at_positive')
+            elif avg_negative_size > avg_positive_size * 1.2:  # Lowered from 1.3
+                head_score -= 1.5  # Larger at negative = head at negative
+                reasons.append('larger_protrusion_at_negative')
+        
+        # Heuristic 3: Horn detection - horns indicate head region
+        for horn_info in top_lateral_protrusions:
+            if horn_info['norm_forward'] > 0.1:
+                head_score += 3.0  # Horns at positive end = head at positive
+                reasons.append('horns_at_positive')
+            elif horn_info['norm_forward'] < -0.1:
+                head_score -= 3.0  # Horns at negative end = head at negative
+                reasons.append('horns_at_negative')
+        
+        confidence_factors.append(min(len(protrusions) / 5.0, 1.0))  # More protrusions = more confidence
+    
+    # Heuristic 4: Vertex distribution (fallback)
+    # Body mass is typically in middle/back, head is lighter
+    mesh = obj.data
+    if len(mesh.vertices) > 0:
+        positive_count = 0
+        negative_count = 0
+        
+        # Sample vertices for efficiency
+        sample_rate = max(1, len(mesh.vertices) // 1000)
+        for i in range(0, len(mesh.vertices), sample_rate):
+            vert = mesh.vertices[i]
+            world_pos = obj.matrix_world @ vert.co
+            relative_pos = world_pos - body_center
+            forward_component = relative_pos.dot(primary_axis)
+            
+            if forward_component > 0:
+                positive_count += 1
+            else:
+                negative_count += 1
+        
+        # Head end typically has fewer vertices (lighter)
+        if positive_count > 0 and negative_count > 0:
+            ratio = positive_count / negative_count
+            if ratio < 0.7:
+                head_score += 0.5  # Fewer at positive = head at positive (lighter)
+                reasons.append('fewer_vertices_at_positive')
+            elif ratio > 1.4:
+                head_score -= 0.5  # Fewer at negative = head at negative
+                reasons.append('fewer_vertices_at_negative')
+    
+    # Determine final direction
+    if head_score > 0:
+        head_direction = 1  # Head at positive direction
+        is_inverted = False
+    elif head_score < 0:
+        head_direction = -1  # Head at negative direction
+        is_inverted = True
+    else:
+        # Neutral - default to positive (standard orientation)
+        head_direction = 1
+        is_inverted = False
+    
+    # Calculate confidence
+    confidence = min(abs(head_score) / 5.0, 1.0)  # Normalize to 0-1
+    if confidence_factors:
+        confidence = confidence * 0.7 + sum(confidence_factors) / len(confidence_factors) * 0.3
+    
+    # Combine reasons
+    reason = ', '.join(reasons) if reasons else 'fallback_vertex_distribution'
+    
+    return {
+        'head_direction': head_direction,
+        'confidence': confidence,
+        'reason': reason,
+        'is_inverted': is_inverted
+    }
+
+
+def calculate_main_axis(obj, body_info, protrusions=None, invert_forward_axis=False):
+    """
+    Calculate the main axis (front/back direction) of the mesh.
+    Uses the longest dimension in the horizontal plane and shape analysis
+    to determine the correct forward direction (head location).
+    
+    Args:
+        obj: Blender object with mesh data
+        body_info: Result from detect_main_body()
+        protrusions: Optional list of protrusions for better orientation detection
+        invert_forward_axis: Manual override to invert the forward axis
+        
+    Returns:
+        dict: {
+            'forward': Vector (normalized forward direction, pointing toward head),
             'up': Vector (normalized up direction),
-            'right': Vector (normalized right direction)
+            'right': Vector (normalized right direction),
+            'is_inverted': bool (True if head is at -Y)
         }
     """
     if not body_info:
@@ -805,7 +1006,8 @@ def calculate_main_axis(obj, body_info):
         return {
             'forward': Vector((0, 1, 0)),
             'up': Vector((0, 0, 1)),
-            'right': Vector((1, 0, 0))
+            'right': Vector((1, 0, 0)),
+            'is_inverted': False
         }
     
     mesh = obj.data
@@ -821,7 +1023,8 @@ def calculate_main_axis(obj, body_info):
         return {
             'forward': Vector((0, 1, 0)),
             'up': Vector((0, 0, 1)),
-            'right': Vector((1, 0, 0))
+            'right': Vector((1, 0, 0)),
+            'is_inverted': False
         }
     
     # Calculate bounding box dimensions
@@ -833,47 +1036,66 @@ def calculate_main_axis(obj, body_info):
                     max(c.z for c in all_coords)))
     size = max_co - min_co
     
-    # Determine up axis (smallest horizontal dimension typically)
-    # In Blender, Z is usually up
+    # Determine up axis (Z is up in Blender)
     up = Vector((0, 0, 1))
     
-    # Forward is the longest horizontal dimension
+    # Forward is along the longest horizontal dimension
     # Compare X and Y dimensions
     if size.x > size.y:
-        # X is longer, so Y is forward/back (standard Blender -Y forward)
-        forward = Vector((0, -1, 0))  # -Y is forward in Blender
+        # X is longer, so Y is forward/back axis
+        # Default to -Y as forward (standard Blender convention)
+        forward_candidate_pos = Vector((0, 1, 0))
+        forward_candidate_neg = Vector((0, -1, 0))
         right = Vector((1, 0, 0))
+        primary_axis = 'Y'
     else:
-        # Y is longer, so X is forward/back
-        forward = Vector((1, 0, 0))
+        # Y is longer, so X is forward/back axis
+        forward_candidate_pos = Vector((1, 0, 0))
+        forward_candidate_neg = Vector((-1, 0, 0))
         right = Vector((0, 1, 0))
-    
-    # Refine forward direction using vertex distribution
-    # The "front" typically has fewer vertices (head end) vs "back" (body mass)
-    center = body_info['center']
-    
-    # Count vertices in front vs back
-    forward_count = 0
-    backward_count = 0
-    
-    for co in all_coords:
-        relative = co - center
-        projection = relative.dot(forward)
-        if projection > 0:
-            forward_count += 1
-        else:
-            backward_count += 1
-    
-    # If more vertices are in the "forward" direction, flip (head is usually lighter)
-    # Actually, for animals, the body mass is usually in the middle/back
-    # This heuristic may need adjustment based on actual models
+        primary_axis = 'X'
     
     bm.free()
+    
+    # Determine primary and lateral axes for orientation detection
+    # Use the same axis determination logic as above
+    if size.x > size.y:
+        # X is longer, so Y is forward/back axis
+        primary_axis_vec = Vector((0, 1, 0))
+        lateral_axis_vec = Vector((1, 0, 0))
+    else:
+        # Y is longer, so X is forward/back axis
+        primary_axis_vec = Vector((1, 0, 0))
+        lateral_axis_vec = Vector((0, 1, 0))
+    
+    # Use detect_model_orientation() to determine which direction is head
+    # Pass the determined primary axis to ensure consistency
+    orientation = detect_model_orientation(obj, body_info, protrusions, 
+                                          primary_axis=primary_axis_vec, 
+                                          lateral_axis=lateral_axis_vec)
+    
+    # Apply orientation detection result
+    if orientation['head_direction'] < 0:
+        # Head is at negative direction
+        forward = forward_candidate_neg
+        is_inverted = True
+    else:
+        # Head is at positive direction
+        forward = forward_candidate_pos
+        is_inverted = False
+    
+    # Apply manual override if specified
+    if invert_forward_axis:
+        forward = -forward
+        is_inverted = not is_inverted
     
     return {
         'forward': forward.normalized(),
         'up': up.normalized(),
-        'right': right.normalized()
+        'right': right.normalized(),
+        'is_inverted': is_inverted,
+        'orientation_confidence': orientation['confidence'],
+        'orientation_reason': orientation['reason']
     }
 
 
@@ -1041,15 +1263,228 @@ def identify_protrusions_geometry(obj, body_info, axes):
     return protrusions
 
 
-def classify_protrusion(protrusion, body_info, axes, template_type='quadruped'):
+def detect_leg_pairs(protrusions, body_info, axes):
+    """
+    Detect leg pairs/groups using symmetry and grouping analysis.
+    
+    Legs characteristics:
+    - Come in sets of 2 or 4 (pairs)
+    - Cylindrical or squarish/rectangular (moderate length_ratio 1.5-3.0)
+    - Symmetrical: left/right pairs are mirror images
+    - All on same side: bottom position (norm_vertical < 0.1)
+    - Similar size within pairs
+    
+    Args:
+        protrusions: List of protrusion dicts from identify_protrusions_geometry()
+        body_info: Result from detect_main_body()
+        axes: Result from calculate_main_axis()
+        
+    Returns:
+        dict: {
+            'leg_groups': list of grouped protrusions (each group is a pair),
+            'leg_candidates': list of protrusions that are likely legs,
+            'confidence': float,
+            'leg_count': int (2 or 4)
+        }
+    """
+    if not protrusions or not body_info:
+        return {
+            'leg_groups': [],
+            'leg_candidates': [],
+            'confidence': 0.0,
+            'leg_count': 0
+        }
+    
+    body_center = body_info['center']
+    body_bounds = body_info['bounds']
+    body_size = body_bounds[1] - body_bounds[0]
+    
+    forward = axes['forward']
+    up = axes['up']
+    right = axes['right']
+    
+    # Calculate body dimensions for normalization
+    body_height = max(abs(body_size.dot(up.normalized())), 0.001)
+    body_width = max(abs(body_size.dot(right.normalized())), 0.001)
+    body_length = max(abs(body_size.dot(forward.normalized())), 0.001)
+    
+    # Filter protrusions at bottom that are leg-shaped
+    leg_candidates = []
+    
+    for p in protrusions:
+        relative_pos = p['relative_position']
+        
+        # Calculate normalized position
+        vertical_component = relative_pos.dot(up)
+        lateral_component = relative_pos.dot(right)
+        forward_component = relative_pos.dot(forward)
+        
+        norm_vertical = vertical_component / body_height
+        norm_lateral = lateral_component / body_width
+        norm_forward = forward_component / body_length
+        
+        # Check if at bottom position (all legs on same side)
+        if norm_vertical < 0.1:  # Below body center
+            # Check if cylindrical/squarish (leg-shaped)
+            length_ratio = p.get('length_ratio', 1.0)
+            
+            # Legs have moderate elongation (1.5-3.0), not too elongated like tail
+            if 1.5 <= length_ratio <= 3.0:
+                leg_candidates.append({
+                    'protrusion': p,
+                    'norm_vertical': norm_vertical,
+                    'norm_lateral': norm_lateral,
+                    'norm_forward': norm_forward,
+                    'length_ratio': length_ratio,
+                    'size': p.get('size', 0)
+                })
+    
+    # Group into pairs based on symmetry (left/right pairs)
+    # Find pairs by matching lateral position (opposite signs, similar magnitude)
+    leg_groups = []
+    used_indices = set()
+    
+    # Sort by forward position to group front/back pairs
+    leg_candidates.sort(key=lambda x: x['norm_forward'], reverse=True)
+    
+    for i, leg1 in enumerate(leg_candidates):
+        if i in used_indices:
+            continue
+        
+        # Find matching pair (opposite lateral position, similar forward position)
+        best_match = None
+        best_match_score = float('inf')
+        best_match_idx = -1
+        
+        for j, leg2 in enumerate(leg_candidates):
+            if j in used_indices or j == i:
+                continue
+            
+            # Check if opposite lateral position (left/right pair)
+            lateral_diff = abs(leg1['norm_lateral'] + leg2['norm_lateral'])  # Should be close to 0 for symmetric pair
+            forward_diff = abs(leg1['norm_forward'] - leg2['norm_forward'])  # Should be similar
+            size_diff = abs(leg1['size'] - leg2['size']) / max(leg1['size'], leg2['size'], 1)  # Similar size
+            
+            # Score: lower is better (more symmetric)
+            score = lateral_diff + forward_diff * 0.5 + size_diff * 0.3
+            
+            # Check if this is a valid pair (opposite sides, similar forward position)
+            if leg1['norm_lateral'] * leg2['norm_lateral'] < 0:  # Opposite sides
+                if score < best_match_score and forward_diff < 0.3:  # Similar forward position
+                    best_match_score = score
+                    best_match = leg2
+                    best_match_idx = j
+        
+        if best_match is not None:
+            # Found a pair
+            leg_groups.append([leg1['protrusion'], best_match['protrusion']])
+            used_indices.add(i)
+            used_indices.add(best_match_idx)
+    
+    # Calculate confidence based on how well pairs match
+    confidence = 0.0
+    if leg_groups:
+        # More pairs = higher confidence
+        if len(leg_groups) == 2:  # 4 legs (2 pairs)
+            confidence = 0.9
+        elif len(leg_groups) == 1:  # 2 legs (1 pair)
+            confidence = 0.7
+        else:
+            confidence = 0.5
+    
+    # Count total legs
+    leg_count = len(leg_groups) * 2
+    
+    # Also include unpaired leg candidates (might be single legs or misdetected)
+    unpaired_candidates = [leg_candidates[i]['protrusion'] for i in range(len(leg_candidates)) if i not in used_indices]
+    
+    return {
+        'leg_groups': leg_groups,
+        'leg_candidates': [lc['protrusion'] for lc in leg_candidates],
+        'unpaired_candidates': unpaired_candidates,
+        'confidence': confidence,
+        'leg_count': leg_count
+    }
+
+
+def analyze_protrusion_shape(protrusion):
+    """
+    Analyze shape characteristics of a protrusion to help distinguish body parts.
+    
+    Key shape heuristics:
+    - Head: blocky/square/circular (length_ratio < 2.0), higher compactness
+    - Tail: elongated/thin (length_ratio > 1.5), NEVER blocky
+    - Legs: moderate length_ratio (1.5-3.0), cylindrical or squarish/rectangular
+    - Wings: large lateral extent, mid-to-high vertical position
+    
+    Args:
+        protrusion: Protrusion dict from identify_protrusions_geometry()
+        
+    Returns:
+        dict: {
+            'is_blocky': bool,  # Square/circular shape (length_ratio < 2.0)
+            'is_elongated': bool,  # Thin/elongated shape (length_ratio > 1.5)
+            'is_cylindrical': bool,  # Cylindrical/squarish (moderate length_ratio 1.5-3.0)
+            'length_ratio': float,
+            'compactness': float,  # Volume/surface area ratio
+            'shape_type': 'head'|'tail'|'leg'|'wing'|'unknown'
+        }
+    """
+    length_ratio = protrusion.get('length_ratio', 1.0)
+    bounds = protrusion.get('bounds', (Vector(), Vector()))
+    
+    # Calculate compactness (simplified: use bounding box volume/surface area)
+    size = bounds[1] - bounds[0]
+    volume = abs(size.x * size.y * size.z)
+    surface_area = 2 * (abs(size.x * size.y) + abs(size.y * size.z) + abs(size.x * size.z))
+    compactness = volume / max(surface_area, 0.001)
+    
+    # Shape classification based on length_ratio
+    # Head: blocky/square/circular (length_ratio < 2.0) - NEVER elongated
+    is_blocky = length_ratio < 2.0
+    
+    # Tail: elongated/thin (length_ratio > 1.5) - NEVER blocky
+    is_elongated = length_ratio > 1.5
+    
+    # Legs: cylindrical or squarish (moderate length_ratio 1.5-3.0)
+    is_cylindrical = 1.5 <= length_ratio <= 3.0
+    
+    # Determine shape type based on characteristics
+    # Head is NEVER elongated, tail is NEVER blocky
+    if is_blocky and not is_elongated:
+        shape_type = 'head'
+    elif is_elongated and length_ratio > 3.0:
+        # Very elongated = likely tail (not leg)
+        shape_type = 'tail'
+    elif is_cylindrical:
+        # Moderate elongation = could be leg or tail depending on position
+        shape_type = 'leg'  # Position will determine final classification
+    elif is_elongated:
+        # Elongated but not very elongated = could be tail or leg
+        shape_type = 'tail'  # Default to tail, position will refine
+    else:
+        shape_type = 'unknown'
+    
+    return {
+        'is_blocky': is_blocky,
+        'is_elongated': is_elongated,
+        'is_cylindrical': is_cylindrical,
+        'length_ratio': length_ratio,
+        'compactness': compactness,
+        'shape_type': shape_type
+    }
+
+
+def classify_protrusion(protrusion, body_info, axes, template_type='quadruped', leg_candidates=None):
     """
     Classify a protrusion as head, leg, tail, or wing based on geometry-relative position
+    and shape analysis.
     
-    Classification rules (geometry-relative):
-    - Head: Top + Front (high vertical, forward position)
-    - Front Legs: Bottom + Front (low vertical, forward position)
-    - Back Legs: Bottom + Back (low vertical, backward position)
-    - Tail: Back + Any vertical (backward position, any height)
+    Classification rules (geometry-relative with shape analysis):
+    - Head: Blocky/square shape (length_ratio < 2.0), top-front position, larger size (15-35% of body)
+    - Tail: Elongated/thin shape (length_ratio > 1.5), back position, NEVER blocky
+    - Legs: Cylindrical/squarish (length_ratio 1.5-3.0), bottom position, come in symmetrical pairs
+    - Horns: Top + lateral position, should be included with head (not classified as legs)
     - Wings: Top + Side (high vertical, lateral position)
     
     Args:
@@ -1057,6 +1492,7 @@ def classify_protrusion(protrusion, body_info, axes, template_type='quadruped'):
         body_info: Result from detect_main_body()
         axes: Result from calculate_main_axis()
         template_type: 'quadruped', 'biped', or 'flying'
+        leg_candidates: Optional list of protrusions identified as leg candidates by detect_leg_pairs()
         
     Returns:
         str: Part name ('head', 'leg_front_l', 'leg_back_r', 'tail', 'wing_l', etc.)
@@ -1072,76 +1508,156 @@ def classify_protrusion(protrusion, body_info, axes, template_type='quadruped'):
     up = axes['up']
     right = axes['right']
     
+    # Check if forward axis is inverted (head at -Y instead of +Y)
+    is_inverted = axes.get('is_inverted', False)
+    
     # Project relative position onto axes
     forward_component = relative_pos.dot(forward)
     vertical_component = relative_pos.dot(up)
     lateral_component = relative_pos.dot(right)
     
     # Normalize by body size for consistent thresholds
-    body_length = max(body_size.dot(forward.normalized()), 0.001)
-    body_height = max(body_size.dot(up.normalized()), 0.001)
-    body_width = max(body_size.dot(right.normalized()), 0.001)
+    body_length = max(abs(body_size.dot(forward.normalized())), 0.001)
+    body_height = max(abs(body_size.dot(up.normalized())), 0.001)
+    body_width = max(abs(body_size.dot(right.normalized())), 0.001)
     
     norm_forward = forward_component / body_length
     norm_vertical = vertical_component / body_height
     norm_lateral = lateral_component / body_width
     
-    # Classification thresholds
-    # Adjusted for more accurate detection
+    # CRITICAL FIX: If inverted, flip the forward component for classification
+    # This makes thresholds work correctly for both orientations
+    # When is_inverted=True (head at -Y), we need to flip so that:
+    # - Head at -Y appears as norm_forward > 0.15 (after flip)
+    # - Tail at +Y appears as norm_forward < -0.15 (after flip)
+    if is_inverted:
+        norm_forward = -norm_forward
     
-    # HEAD: Top front - high vertical component, forward position
-    # Tightened thresholds to prevent neck/upper body from being included
-    if norm_vertical > 0.15 and norm_forward > 0.2:  # Increased vertical threshold from 0.1 to 0.15
-        # Additional checks to prevent misclassification
-        # Head usually has moderate length ratio (not too elongated like neck)
-        if length_ratio < 3.5:  # Tightened from 4.0 to exclude elongated neck regions
-            # Check size relative to body - head should be 15-35% of body size
+    # Get shape analysis for this protrusion
+    shape = analyze_protrusion_shape(protrusion)
+    is_blocky = shape['is_blocky']
+    is_elongated = shape['is_elongated']
+    is_cylindrical = shape['is_cylindrical']
+    
+    # Check if this protrusion is in the leg candidates list
+    is_leg_candidate = False
+    if leg_candidates:
+        for lc in leg_candidates:
+            if lc.get('vertex_indices') == protrusion.get('vertex_indices'):
+                is_leg_candidate = True
+                break
+    
+    # ==========================================================================
+    # HORN DETECTION (check first to exclude from leg classification)
+    # Horns: Top position (+Z) and lateral position - should be included with head
+    # ==========================================================================
+    if norm_vertical > 0.3 and abs(norm_lateral) > 0.2:
+        # Horns are at top and sides - exclude from leg classification
+        # Horns are typically at head region, so include with head
+        if abs(norm_forward) > 0.1:
+            # Near head region - include with head
+            return 'head'
+    
+    # ==========================================================================
+    # HEAD DETECTION (shape-based: blocky/square, larger size)
+    # Head: blocky/square shape (length_ratio < 2.0), top-front position
+    # ==========================================================================
+    if abs(norm_forward) > 0.15:  # Significant forward/back position
+        # Check shape: head is blocky/square (low length_ratio)
+        if is_blocky and not is_elongated:  # Head is NEVER elongated
+            # Check size: head is typically 15-35% of body (larger than tail)
             body_vertex_count = len(body_info.get('vertex_indices', set()))
             protrusion_vertex_count = protrusion.get('size', 0)
             if body_vertex_count > 0:
                 size_ratio = protrusion_vertex_count / body_vertex_count
-                # Head should not be larger than 35% of body (typically 15-25%)
-                if size_ratio <= 0.35:
-                    return 'head'
+                is_head_sized = 0.10 <= size_ratio <= 0.40  # Head size range (10-40%)
+                
+                if is_head_sized:
+                    # Check vertical position (head is typically at top or mid-height)
+                    if norm_vertical > -0.2:  # Not at bottom
+                        # Head at forward position
+                        if norm_forward > 0.15:
+                            return 'head'
     
-    # TAIL: Back position - prioritize this classification
-    # Tail can be at various vertical positions but is always at the back
-    if norm_forward < -0.2:  # Lowered threshold - any significant backward position
-        # Check if it's elongated (typical tail shape)
-        if length_ratio > 1.2:  # Lowered from 1.5
+    # ==========================================================================
+    # TAIL DETECTION (shape-based: elongated/thin, back position)
+    # Tail: elongated/thin shape (length_ratio > 1.5), NEVER blocky
+    # NOTE: Models may have no tail - don't force tail classification
+    # ==========================================================================
+    if norm_forward < -0.15:  # Back position
+        # Tail is ALWAYS elongated (high length_ratio), NEVER blocky
+        if is_elongated and not is_blocky:
+            # Only classify as tail if it's clearly elongated (not a back leg)
+            if length_ratio > 1.8:  # Higher threshold to avoid misclassifying back legs
+                return 'tail'
+        
+        # Very elongated protrusion at back = definitely tail
+        if length_ratio > 2.5:
             return 'tail'
-        # Even if not elongated, if it's clearly at the back and not a leg, it's tail
-        # Legs are at bottom (norm_vertical < 0.1), tail can be at any height
-        if norm_forward < -0.3 and norm_vertical > -0.3:  # Back but not bottom = tail
-            return 'tail'
-        # Very back position = tail regardless of shape
-        if norm_forward < -0.4:
+        
+        # Back position + not at bottom + not blocky = likely tail
+        # But only if it's elongated enough to be a tail (not just a back protrusion)
+        if norm_vertical > -0.2 and not is_blocky:
+            if length_ratio > 1.5:  # Require more elongation
+                return 'tail'
+        
+        # Very back position = tail regardless of shape (unless at bottom = back legs)
+        # But only if it's elongated - blocky back protrusions are not tails
+        if norm_forward < -0.4 and norm_vertical > -0.1 and length_ratio > 1.2:
             return 'tail'
     
-    # WINGS (for flying template): Top + Side
-    if template_type == 'flying':
-        if norm_vertical > 0.0 and abs(norm_lateral) > 0.3:
+    # ==========================================================================
+    # WINGS: Top + Side (large lateral extent, mid-to-high vertical)
+    # Works for flying template and also detects wings in other templates
+    # ==========================================================================
+    # Check for wing-like protrusions: large lateral extent, mid-to-high vertical
+    if abs(norm_lateral) > 0.3 and norm_vertical > -0.1:
+        # Wings have large lateral extent
+        # Check if this protrusion has wing-like shape (large lateral, mid-height)
+        protrusion_bounds = protrusion.get('bounds', (Vector(), Vector()))
+        protrusion_size = protrusion_bounds[1] - protrusion_bounds[0]
+        
+        # Wings are typically wider than they are tall/deep
+        lateral_extent = abs(protrusion_size.dot(right.normalized()))
+        vertical_extent = abs(protrusion_size.dot(up.normalized()))
+        forward_extent = abs(protrusion_size.dot(forward.normalized()))
+        
+        # Wing heuristic: lateral extent > vertical extent, and lateral > forward
+        is_wing_shaped = lateral_extent > vertical_extent * 0.8 and lateral_extent > forward_extent * 0.5
+        
+        if template_type == 'flying' or is_wing_shaped:
             if norm_lateral < 0:
                 return 'wing_l'
             else:
                 return 'wing_r'
     
-    # LEGS: Bottom position
-    if norm_vertical < 0.1:  # Below body center
-        # Front legs: bottom + front
-        if norm_forward > -0.1:
-            if norm_lateral < 0:
-                return 'leg_front_l'
+    # ==========================================================================
+    # LEG DETECTION (shape-based: cylindrical/squarish, bottom position, pairs)
+    # Legs: cylindrical/squarish (length_ratio 1.5-3.0), bottom position
+    # ==========================================================================
+    if norm_vertical < 0.1:  # Below body center (all legs on same side)
+        # Check shape: legs are cylindrical/squarish (moderate length_ratio)
+        # Legs are NOT as elongated as tail, NOT as blocky as head
+        is_leg_shaped = is_cylindrical or (1.0 <= length_ratio <= 3.5)
+        
+        # If this protrusion is in the leg candidates list, prioritize leg classification
+        if is_leg_shaped or is_leg_candidate:
+            # Front legs: bottom + front
+            if norm_forward > -0.1:
+                if norm_lateral < 0:
+                    return 'leg_front_l'
+                else:
+                    return 'leg_front_r'
+            # Back legs: bottom + back
             else:
-                return 'leg_front_r'
-        # Back legs: bottom + back
-        else:
-            if norm_lateral < 0:
-                return 'leg_back_l'
-            else:
-                return 'leg_back_r'
+                if norm_lateral < 0:
+                    return 'leg_back_l'
+                else:
+                    return 'leg_back_r'
     
+    # ==========================================================================
     # ARMS (for biped): Mid-height + Side
+    # ==========================================================================
     if template_type == 'biped':
         if abs(norm_lateral) > 0.3 and norm_vertical > -0.2:
             if norm_lateral < 0:
@@ -1149,9 +1665,11 @@ def classify_protrusion(protrusion, body_info, axes, template_type='quadruped'):
             else:
                 return 'arm_r'
     
-    # Default: if position is ambiguous, check length ratio
+    # ==========================================================================
+    # FALLBACK: Ambiguous position - use shape and position heuristics
+    # ==========================================================================
     # Elongated protrusions at bottom are likely legs
-    if norm_vertical < 0.2 and length_ratio > 1.5:
+    if norm_vertical < 0.2 and is_cylindrical:
         if norm_forward > 0:
             if norm_lateral < 0:
                 return 'leg_front_l'
@@ -1163,11 +1681,28 @@ def classify_protrusion(protrusion, body_info, axes, template_type='quadruped'):
             else:
                 return 'leg_back_r'
     
+    # Blocky protrusion at front = likely head
+    if is_blocky and norm_forward > 0.1 and norm_vertical > -0.2:
+        return 'head'
+    
+    # Elongated protrusion at back = likely tail (only if clearly elongated)
+    # Don't force tail classification - models may have no tail
+    if is_elongated and norm_forward < -0.1 and length_ratio > 1.8:
+        return 'tail'
+    
+    # Large lateral protrusions at mid-height could be wings
+    if abs(norm_lateral) > 0.4 and norm_vertical > -0.1:
+        if norm_lateral < 0:
+            return 'wing_l'
+        else:
+            return 'wing_r'
+    
     # Fallback: assign to body
+    # This is the correct behavior for models without tails or wings
     return 'body'
 
 
-def segment_by_geometry(obj, template, template_type='quadruped', use_fast_mode=False, progress_callback=None):
+def segment_by_geometry(obj, template, template_type='quadruped', use_fast_mode=False, progress_callback=None, invert_forward_axis=False):
     """
     Segment mesh using geometry-relative positioning
     
@@ -1176,9 +1711,9 @@ def segment_by_geometry(obj, template, template_type='quadruped', use_fast_mode=
     
     Key principle: Use geometry-relative positioning
     - Body = Center of geometry (largest connected component, central mass)
-    - Head = Top front (relative to body center and main axis)
-    - Legs = Bottom front/back (relative to body center)
-    - Tail = Back (relative to body center and main axis)
+    - Head = Top front (relative to body center and main axis), blocky/square shape
+    - Legs = Bottom front/back (relative to body center), cylindrical/squarish, symmetrical pairs
+    - Tail = Back (relative to body center and main axis), elongated/thin shape
     - Wings = Top/side (relative to body center)
     
     Args:
@@ -1187,6 +1722,7 @@ def segment_by_geometry(obj, template, template_type='quadruped', use_fast_mode=
         template_type: 'quadruped', 'biped', or 'flying'
         use_fast_mode: If True, skip expensive operations
         progress_callback: Optional function(percent, message) for progress updates
+        invert_forward_axis: Manual override to invert the forward axis
         
     Returns:
         dict: Mapping of part names to lists of vertex indices
@@ -1211,24 +1747,50 @@ def segment_by_geometry(obj, template, template_type='quadruped', use_fast_mode=
         return {}
     
     if progress_callback:
-        progress_callback(30, "Calculating main axis...")
+        progress_callback(25, "Identifying protrusions for orientation detection...")
     
-    # Step 2: Calculate main axis (front/back direction)
-    axes = calculate_main_axis(obj, body_info)
-    
-    if progress_callback:
-        progress_callback(40, "Identifying protrusions...")
-    
-    # Step 3: Identify protrusions (skip in fast mode or for large meshes)
+    # Step 2: Identify protrusions FIRST (needed for orientation detection)
     # Protrusion detection is expensive - skip for speed in preview mode
     if use_fast_mode or len(mesh.vertices) > 100000:
-        # Skip protrusion detection for speed
+        # Skip protrusion detection for speed - use default axes
         protrusions = []
+        # Use simple axis calculation without protrusions
+        axes = calculate_main_axis(obj, body_info, protrusions=None, invert_forward_axis=invert_forward_axis)
     else:
-        protrusions = identify_protrusions_geometry(obj, body_info, axes)
+        # First pass: get preliminary axes for protrusion detection
+        preliminary_axes = {
+            'forward': Vector((0, -1, 0)),  # Default -Y forward
+            'up': Vector((0, 0, 1)),
+            'right': Vector((1, 0, 0)),
+            'is_inverted': False
+        }
+        
+        if progress_callback:
+            progress_callback(30, "Identifying protrusions...")
+        
+        protrusions = identify_protrusions_geometry(obj, body_info, preliminary_axes)
+        
+        if progress_callback:
+            progress_callback(40, "Calculating main axis with orientation detection...")
+        
+        # Step 3: Calculate main axis with protrusions for better orientation detection
+        axes = calculate_main_axis(obj, body_info, protrusions=protrusions, invert_forward_axis=invert_forward_axis)
+        
+        # Re-identify protrusions with correct axes if orientation was inverted
+        if axes.get('is_inverted', False):
+            if progress_callback:
+                progress_callback(45, "Re-analyzing protrusions with corrected orientation...")
+            protrusions = identify_protrusions_geometry(obj, body_info, axes)
     
     if progress_callback:
-        progress_callback(50, "Initializing vertex groups...")
+        progress_callback(50, "Detecting leg pairs...")
+    
+    # Step 3.5: Detect leg pairs/groups using symmetry analysis
+    leg_info = detect_leg_pairs(protrusions, body_info, axes)
+    leg_candidates = leg_info.get('leg_candidates', [])
+    
+    if progress_callback:
+        progress_callback(55, "Initializing vertex groups...")
     
     # Step 4: Initialize vertex groups
     vertex_groups = {}
@@ -1254,7 +1816,8 @@ def segment_by_geometry(obj, template, template_type='quadruped', use_fast_mode=
     classified_protrusions = defaultdict(list)
     
     for protrusion in protrusions:
-        part_name = classify_protrusion(protrusion, body_info, axes, template_type)
+        # Pass leg candidates to improve leg classification
+        part_name = classify_protrusion(protrusion, body_info, axes, template_type, leg_candidates=leg_candidates)
         classified_protrusions[part_name].append(protrusion)
     
     # Handle multiple protrusions classified as the same part

@@ -14,6 +14,7 @@ from . import roblox_r6_joints
 from . import batch_export
 from . import manual_segment
 from . import symmetry
+from . import manual_part_selection
 
 __all__ = [
     "mesh_optimizer",
@@ -27,4 +28,5 @@ __all__ = [
     "batch_export",
     "manual_segment",
     "symmetry",
+    "manual_part_selection",
 ]

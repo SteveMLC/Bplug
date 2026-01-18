@@ -73,6 +73,10 @@ class PET_OT_assign_selection_to_segment(Operator):
             self.report({'ERROR'}, "No vertices selected")
             return {'CANCELLED'}
         
+        # Extract vertex data BEFORE mode switch (bmesh becomes invalid after mode switch)
+        vert_count = len(bm.verts)
+        vert_indices = [v.index for v in selected_verts]
+        
         bpy.ops.object.mode_set(mode='OBJECT')
         
         group_name = f"Segment_{self.segment_name}"
@@ -81,8 +85,6 @@ class PET_OT_assign_selection_to_segment(Operator):
         else:
             vg = obj.vertex_groups.new(name=group_name)
         
-        vert_indices = [v.index for v in selected_verts]
-        
         if len(vert_indices) > CHUNK_SIZE:
             for i in range(0, len(vert_indices), CHUNK_SIZE):
                 if time.time() - start_time > TIMEOUT_SECONDS:
@@ -90,12 +92,12 @@ class PET_OT_assign_selection_to_segment(Operator):
                     break
                 chunk = vert_indices[i:i + CHUNK_SIZE]
                 vg.add(chunk, 1.0, 'REPLACE')
-                if len(bm.verts) > MAX_VERTS_DIRECT:
+                if vert_count > MAX_VERTS_DIRECT:
                     context.window_manager.progress_update((i / len(vert_indices)) * 100)
         else:
             vg.add(vert_indices, 1.0, 'REPLACE')
         
-        if len(bm.verts) > MAX_VERTS_DIRECT:
+        if vert_count > MAX_VERTS_DIRECT:
             context.window_manager.progress_end()
         
         bpy.ops.object.mode_set(mode='EDIT')

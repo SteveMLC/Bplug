@@ -39,7 +39,7 @@ def get_mesh_bounds(obj):
 
 def segment_by_regions(obj, template, use_connectivity_refinement=True, sensitivity=0.5, 
                        auto_detect_protrusions=True, use_geometry_based=True, template_type='quadruped',
-                       use_fast_mode=False, timeout=None):
+                       use_fast_mode=False, timeout=None, invert_forward_axis=False):
     """
     Segment mesh into body parts using geometry-based detection (primary) or spatial regions (fallback)
     
@@ -51,6 +51,7 @@ def segment_by_regions(obj, template, use_connectivity_refinement=True, sensitiv
         auto_detect_protrusions: Automatically detect and refine protrusions (legs, wings, tails)
         use_geometry_based: Use geometry-based detection (recommended) vs spatial-only
         template_type: 'quadruped', 'biped', or 'flying'
+        invert_forward_axis: Manual override to invert the forward axis (swap head/tail)
     
     Returns:
         dict: Vertex groups created with vertex indices
@@ -90,7 +91,7 @@ def segment_by_regions(obj, template, use_connectivity_refinement=True, sensitiv
             
             geometry_result = segmentation_refinement.segment_by_geometry(
                 obj, template, template_type, use_fast_mode=use_fast_mode,
-                progress_callback=progress_callback
+                progress_callback=progress_callback, invert_forward_axis=invert_forward_axis
             )
             
             elapsed = time.time() - start_time

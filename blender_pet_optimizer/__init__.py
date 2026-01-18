@@ -25,14 +25,18 @@ modules_to_register = [
     operators.rigging,
     operators.standardization,
     operators.export,
-    operators.edge_cut_segmentation,
+    getattr(operators, 'edge_cut_segmentation', None),
     operators.roblox_r6_joints,
     operators.batch_export,
     operators.manual_segment,
     operators.symmetry,
+    operators.manual_part_selection,
     ui.panels,
     ui.preferences,
 ]
+
+# Filter out None values (failed imports) - this allows the addon to load even if some modules fail
+modules_to_register = [m for m in modules_to_register if m is not None]
 
 
 def register():

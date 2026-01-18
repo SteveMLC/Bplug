@@ -484,45 +484,60 @@ class PET_OT_split_by_vertex_groups(Operator):
                 # Get fresh mesh reference (mesh data persists even if object changes)
                 current_mesh = original_obj.data
                 
-                # Deselect all vertices first
-                for vertex in current_mesh.vertices:
-                    vertex.select = False
-                
-                # Select vertices in this group
+                # Build vertex mask for this vertex group
                 vg_index = original_obj.vertex_groups.find(vg.name)
                 if vg_index == -1:
                     continue
                 
-                vertices_selected = 0
+                # Create vertex mask: True if vertex is in this group with weight > 0.5
+                vertex_mask = [False] * len(current_mesh.vertices)
+                vertices_in_group = 0
                 for vertex in current_mesh.vertices:
                     for group in vertex.groups:
                         if group.group == vg_index and group.weight > 0.5:
-                            vertex.select = True
-                            vertices_selected += 1
+                            vertex_mask[vertex.index] = True
+                            vertices_in_group += 1
                             break
                 
-                if vertices_selected == 0:
+                if vertices_in_group == 0:
                     continue  # Skip if no vertices in this group
                 
-                # Switch to edit mode to select connected faces
+                # Switch to edit mode to select faces
                 bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_mode(type='VERT')
-                bpy.ops.mesh.select_mode(type='FACE')
+                bpy.ops.mesh.select_all(action='DESELECT')  # Clear selection first
+                bpy.ops.mesh.select_mode(type='FACE')  # Set to face mode
                 
-                # Select faces connected to selected vertices
+                # Use bmesh to reliably select faces where majority of vertices are in vertex group
+                # This avoids the selection loss issue when switching modes
+                bm = bmesh.from_edit_mesh(current_mesh)
+                bm.faces.ensure_lookup_table()
+                bm.verts.ensure_lookup_table()
+                
+                faces_selected = 0
+                for face in bm.faces:
+                    # Count vertices in this face that belong to the vertex group
+                    verts_in_group = sum(1 for v in face.verts if vertex_mask[v.index])
+                    # Face belongs to group if majority of its vertices are in the group
+                    if verts_in_group >= len(face.verts) / 2:  # Majority threshold
+                        face.select = True
+                        faces_selected += 1
+                
+                # Update edit mesh with selection
+                bmesh.update_edit_mesh(current_mesh)
+                bm.free()
+                
+                # Select linked faces to get connected geometry
                 bpy.ops.mesh.select_linked(delimit={'SEAM'})
                 
                 # Go back to object mode to check selection
                 bpy.ops.object.mode_set(mode='OBJECT')
                 
-                # Check selection count in current mesh
-                # NOTE: After previous splits, some vertices may have been removed from original
-                # This is expected - vertices can only be in one split object
-                selected_count = sum(1 for v in current_mesh.vertices if v.select)
-                if selected_count == 0:
-                    # No vertices selected - might be because they were already split in previous iteration
-                    self.report({'INFO'}, f"Vertex group '{vg.name}' has no remaining vertices (may have been split already)")
-                    continue  # Skip if selection was lost
+                # Validate that faces are actually selected before attempting to separate
+                selected_faces = sum(1 for p in current_mesh.polygons if p.select)
+                if selected_faces == 0:
+                    # No faces selected - selection might have failed
+                    self.report({'WARNING'}, f"No faces selected for vertex group '{vg.name}' - skipping")
+                    continue  # Skip if no faces selected
                 
                 # Go back to edit mode and separate
                 bpy.ops.object.mode_set(mode='EDIT')
