@@ -108,8 +108,19 @@ Use with a Roblox Studio import script to create Motor6D joints automatically.
 
 ## Recent Changes
 - Added edge-loop based segment marking
-- Implemented Roblox R6 Motor6D joint system
+- Implemented Roblox R6 Motor6D joint system with full CFrame data (position + rotation + 4x4 matrix)
 - Created batch processing for 100+ models
 - Enhanced UI with Quick Segment panel
 - Added R6 Joints panel with visualization
 - Added Batch Operations panel
+- Fixed C0/C1 transform computation to use part-local space for Motor6D compatibility
+- Updated batch export to handle unsplit models with proper manifest counts
+- Improved joint orientation calculation based on part directions
+
+## R6 Joint Data Format
+The exported JSON includes for each joint:
+- `c0`/`c1`: Position, rotation (Euler), and full 4x4 matrix
+- `world_position`/`world_rotation`: Joint location in world space
+- `part0`/`part1`: Connected part names
+
+Use the matrix for exact CFrame reconstruction in Roblox import scripts.
