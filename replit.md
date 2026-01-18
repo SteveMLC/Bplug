@@ -107,6 +107,12 @@ Use with a Roblox Studio import script to create Motor6D joints automatically.
 - R6 joint compatibility required for Roblox
 
 ## Recent Changes
+- Added Manual Segment panel for hands-on vertex selection workflow
+- Added Quick Decimate tool to reduce 300k+ vertex models before cutting
+- Implemented selection refinement tools: Grow, Shrink, Smooth Boundary
+- Created one-click segment assignment buttons (Head, Legs, Tail, Wings)
+- Added "Assign Remaining as Body" for quick body assignment
+- Added segment preview with color-coded vertex visualization
 - Added edge-loop based segment marking
 - Implemented Roblox R6 Motor6D joint system with full CFrame data (position + rotation + 4x4 matrix)
 - Created batch processing for 100+ models
