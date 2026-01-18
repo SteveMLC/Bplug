@@ -12,6 +12,7 @@ from . import export
 from . import edge_cut_segmentation
 from . import roblox_r6_joints
 from . import batch_export
+from . import manual_segment
 
 __all__ = [
     "mesh_optimizer",
@@ -23,4 +24,5 @@ __all__ = [
     "edge_cut_segmentation",
     "roblox_r6_joints",
     "batch_export",
+    "manual_segment",
 ]

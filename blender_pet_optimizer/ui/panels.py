@@ -852,12 +852,122 @@ class PET_PT_batch_operations(Panel):
         tip_box.label(text="5. Click 'Export All Models'")
 
 
+class PET_PT_manual_segment(Panel):
+    """Simple manual segmentation panel - optimized for high-poly models"""
+    bl_label = "Manual Segment"
+    bl_idname = "PET_PT_manual_segment"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        
+        if not obj or obj.type != 'MESH':
+            layout.label(text="Select a mesh object", icon='INFO')
+            return
+        
+        face_count = len(obj.data.polygons)
+        layout.label(text=f"Faces: {face_count:,}", icon='MESH_DATA')
+        
+        if face_count > 100000:
+            warn_box = layout.box()
+            warn_box.label(text="High-Poly Model Detected", icon='ERROR')
+            warn_box.label(text="Consider decimating first for easier selection")
+            warn_box.operator("pet.quick_decimate", text="Quick Decimate", icon='MOD_DECIM')
+            layout.separator()
+        
+        select_box = layout.box()
+        select_box.label(text="1. Select Vertices", icon='VERTEXSEL')
+        
+        if obj.mode != 'EDIT':
+            select_box.label(text="Switch to Edit mode to select", icon='INFO')
+            select_box.operator("object.mode_set", text="Enter Edit Mode").mode = 'EDIT'
+        else:
+            select_box.label(text="Use Blender's selection tools:")
+            select_box.label(text="  - Box Select (B)")
+            select_box.label(text="  - Circle Select (C)")
+            select_box.label(text="  - Lasso Select (Ctrl+click)")
+            
+            select_box.separator()
+            select_box.label(text="Refine Selection:", icon='MODIFIER')
+            
+            row = select_box.row(align=True)
+            row.operator("pet.grow_selection", text="Grow +")
+            row.operator("pet.shrink_selection", text="Shrink -")
+            
+            row = select_box.row(align=True)
+            row.operator("pet.smooth_selection_boundary", text="Smooth Boundary")
+            row.operator("pet.select_linked_flat", text="Select Linked Flat")
+        
+        layout.separator()
+        
+        assign_box = layout.box()
+        assign_box.label(text="2. Assign to Segment", icon='GROUP_VERTEX')
+        
+        segment_names = ['Head', 'Leg_Front_L', 'Leg_Front_R', 'Leg_Back_L', 'Leg_Back_R', 'Tail', 'Wing_L', 'Wing_R']
+        
+        col = assign_box.column(align=True)
+        for i in range(0, len(segment_names), 2):
+            row = col.row(align=True)
+            for j in range(2):
+                if i + j < len(segment_names):
+                    name = segment_names[i + j]
+                    op = row.operator("pet.assign_selection_to_segment", text=name)
+                    op.segment_name = name
+        
+        assign_box.separator()
+        assign_box.operator("pet.invert_assign_body", text="Assign Remaining as Body", icon='MESH_CUBE')
+        
+        layout.separator()
+        
+        segment_groups = [vg for vg in obj.vertex_groups if vg.name.startswith("Segment_")]
+        if segment_groups:
+            preview_box = layout.box()
+            preview_box.label(text="3. Current Segments", icon='HIDE_OFF')
+            
+            preview_box.operator("pet.preview_segments", text="Preview Colors", icon='COLOR')
+            
+            for vg in segment_groups:
+                segment_name = vg.name[8:]
+                row = preview_box.row(align=True)
+                
+                vert_count = 0
+                vg_index = vg.index
+                for v in obj.data.vertices:
+                    for g in v.groups:
+                        if g.group == vg_index and g.weight > 0.5:
+                            vert_count += 1
+                            break
+                
+                row.label(text=f"{segment_name}: {vert_count:,}")
+                
+                select_op = row.operator("pet.select_segment", text="", icon='RESTRICT_SELECT_OFF')
+                select_op.segment_name = segment_name
+                
+                clear_op = row.operator("pet.clear_segment", text="", icon='X')
+                clear_op.segment_name = segment_name
+            
+            layout.separator()
+            
+            split_box = layout.box()
+            split_box.label(text="4. Split Model", icon='MOD_EXPLODE')
+            split_box.operator("pet.split_by_segments", text="Split Into Parts", icon='UNLINKED')
+            
+            split_box.separator()
+            split_box.label(text="After splitting, use R6 Joints panel", icon='INFO')
+
+
 classes = [
     PET_SegmentationSettings,
     PET_ManualAssignmentState,
     PET_PT_main_panel,
     PET_PT_mesh_optimization,
     PET_PT_segmentation,
+    PET_PT_manual_segment,
     PET_PT_edge_cut_segmentation,
     PET_PT_rigging,
     PET_PT_r6_joints,
