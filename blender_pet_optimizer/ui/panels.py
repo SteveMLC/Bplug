@@ -875,9 +875,9 @@ class PET_PT_manual_segment(Panel):
         
         if face_count > 100000:
             warn_box = layout.box()
-            warn_box.label(text="High-Poly Model Detected", icon='ERROR')
-            warn_box.label(text="Consider decimating first for easier selection")
-            warn_box.operator("pet.quick_decimate", text="Quick Decimate", icon='MOD_DECIM')
+            warn_box.label(text="High-Poly Model Detected", icon='INFO')
+            warn_box.label(text="Segment on full mesh to preserve quality")
+            warn_box.label(text="Decimate after splitting if needed")
             layout.separator()
         
         select_box = layout.box()
@@ -958,7 +958,12 @@ class PET_PT_manual_segment(Panel):
             split_box.operator("pet.split_by_segments", text="Split Into Parts", icon='UNLINKED')
             
             split_box.separator()
-            split_box.label(text="After splitting, use R6 Joints panel", icon='INFO')
+            split_box.label(text="5. Optimize (Optional)", icon='MOD_DECIM')
+            split_box.label(text="After splitting, decimate individual parts if needed")
+            split_box.operator("pet.quick_decimate", text="Decimate Selected Part", icon='MOD_DECIM')
+            
+            split_box.separator()
+            split_box.label(text="6. Create R6 Joints", icon='BONE_DATA')
 
 
 classes = [

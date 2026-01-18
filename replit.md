@@ -114,7 +114,16 @@ For large meshes (300k+ vertices):
 - 60-second timeout per segment during splitting
 - Chunk processing (50k vertices at a time)
 - Graceful partial completion on timeout
-- Recommendation: Use Quick Decimate first to reduce complexity
+
+## Workflow Order (Preserve Quality)
+Preferred order to maintain mesh integrity:
+1. **Segment** the full-quality original mesh
+2. **Split** into separate body parts
+3. **Decimate** individual parts afterwards (if needed for Roblox)
+4. **Create R6 Joints** on the final parts
+5. **Export** for Roblox
+
+This preserves maximum mesh detail until the final optimization step.
 
 ## Recent Changes
 - Added Manual Segment panel for hands-on vertex selection workflow
