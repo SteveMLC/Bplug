@@ -607,16 +607,249 @@ class PET_PT_export(Panel):
     def draw(self, context):
         layout = self.layout
         
-        # Export model operator
         op_export = layout.operator("pet.export_model", text="Export Model")
         layout.prop(op_export, "format", expand=True)
         layout.prop(op_export, "include_metadata")
         
         layout.separator()
         
-        # Export part library operator
         op_lib = layout.operator("pet.export_part_library", text="Export Part Library")
         layout.prop(op_lib, "format", expand=True)
+
+
+class PET_PT_edge_cut_segmentation(Panel):
+    """Edge-cut based segmentation for efficient batch workflow"""
+    bl_label = "Quick Segment (Edge Cuts)"
+    bl_idname = "PET_PT_edge_cut_segmentation"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        
+        if not obj or obj.type != 'MESH':
+            layout.label(text="Select a mesh object", icon='INFO')
+            return
+        
+        info_box = layout.box()
+        info_box.label(text="Fast Segmentation Workflow", icon='INFO')
+        info_box.label(text="1. Select edge loops around appendages")
+        info_box.label(text="2. Mark each cut with segment name")
+        info_box.label(text="3. Apply - remaining mesh becomes body")
+        layout.separator()
+        
+        marked_segments = obj.get("pet_marked_segments", [])
+        if marked_segments:
+            status_box = layout.box()
+            status_box.label(text="Marked Segments:", icon='CHECKMARK')
+            for seg in marked_segments:
+                row = status_box.row()
+                row.label(text=f"  {seg}")
+                select_op = row.operator("pet.select_segment_edges", text="", icon='RESTRICT_SELECT_OFF')
+                select_op.segment_name = seg
+        
+        layout.separator()
+        
+        layout.label(text="Mark Selected Edges As:", icon='EDGESEL')
+        
+        col = layout.column(align=True)
+        
+        row = col.row(align=True)
+        op = row.operator("pet.mark_segment_cut", text="Head")
+        op.segment_name = 'head'
+        
+        row = col.row(align=True)
+        op = row.operator("pet.mark_segment_cut", text="Front L Leg")
+        op.segment_name = 'leg_front_l'
+        op = row.operator("pet.mark_segment_cut", text="Front R Leg")
+        op.segment_name = 'leg_front_r'
+        
+        row = col.row(align=True)
+        op = row.operator("pet.mark_segment_cut", text="Back L Leg")
+        op.segment_name = 'leg_back_l'
+        op = row.operator("pet.mark_segment_cut", text="Back R Leg")
+        op.segment_name = 'leg_back_r'
+        
+        row = col.row(align=True)
+        op = row.operator("pet.mark_segment_cut", text="Tail")
+        op.segment_name = 'tail'
+        
+        row = col.row(align=True)
+        op = row.operator("pet.mark_segment_cut", text="Left Wing")
+        op.segment_name = 'wing_l'
+        op = row.operator("pet.mark_segment_cut", text="Right Wing")
+        op.segment_name = 'wing_r'
+        
+        layout.separator()
+        
+        action_box = layout.box()
+        action_box.label(text="Actions", icon='PLAY')
+        
+        row = action_box.row(align=True)
+        row.operator("pet.preview_segment_cuts", text="Preview", icon='HIDE_OFF')
+        row.operator("pet.clear_segment_cuts", text="Clear All", icon='X')
+        
+        action_box.separator()
+        
+        apply_row = action_box.row()
+        apply_row.scale_y = 1.5
+        apply_op = apply_row.operator("pet.apply_segment_cuts", text="Apply Cuts & Create Groups", icon='CHECKMARK')
+        
+        if obj.vertex_groups:
+            action_box.separator()
+            split_op = action_box.operator("pet.split_by_vertex_groups", text="Split Into Parts", icon='MODIFIER_ON')
+            split_op.create_pivots = True
+            split_op.keep_original = True
+
+
+class PET_PT_r6_joints(Panel):
+    """Roblox R6 Joint System panel"""
+    bl_label = "Roblox R6 Joints"
+    bl_idname = "PET_PT_r6_joints"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        body_found = False
+        segments_found = []
+        joints_found = []
+        
+        for obj in context.scene.objects:
+            if obj.type == 'MESH':
+                name_lower = obj.name.lower()
+                if 'body' in name_lower or 'torso' in name_lower:
+                    body_found = True
+                elif any(x in name_lower for x in ['head', 'leg', 'tail', 'wing']):
+                    segments_found.append(obj.name)
+            elif obj.type == 'EMPTY' and 'r6_joint_type' in obj:
+                joints_found.append(obj.name)
+        
+        status_box = layout.box()
+        status_box.label(text="Scene Status", icon='SCENE_DATA')
+        
+        if body_found:
+            status_box.label(text="Body mesh found", icon='CHECKMARK')
+        else:
+            status_box.label(text="No body mesh found", icon='ERROR')
+        
+        if segments_found:
+            status_box.label(text=f"{len(segments_found)} segment meshes found", icon='CHECKMARK')
+        else:
+            status_box.label(text="No segment meshes found", icon='INFO')
+        
+        if joints_found:
+            status_box.label(text=f"{len(joints_found)} R6 joints created", icon='CHECKMARK')
+        
+        layout.separator()
+        
+        if body_found and segments_found:
+            create_box = layout.box()
+            create_box.label(text="Create R6 Joints", icon='CON_PIVOT')
+            
+            row = create_box.row()
+            row.scale_y = 1.5
+            create_op = row.operator("pet.create_r6_joints", text="Create R6 Joints", icon='CON_PIVOT')
+            
+            create_box.prop(create_op, "joint_scale")
+            create_box.prop(create_op, "use_custom_offsets")
+            
+            layout.separator()
+        else:
+            layout.label(text="Split mesh into parts first", icon='INFO')
+        
+        if joints_found:
+            viz_box = layout.box()
+            viz_box.label(text="Visualization", icon='HIDE_OFF')
+            viz_box.operator("pet.visualize_r6_hierarchy", text="Show Joint Hierarchy", icon='OUTLINER')
+            
+            layout.separator()
+            
+            export_box = layout.box()
+            export_box.label(text="Export for Roblox", icon='EXPORT')
+            export_box.operator("pet.export_r6_metadata", text="Export R6 Metadata (JSON)", icon='FILE')
+        
+        layout.separator()
+        
+        info_box = layout.box()
+        info_box.label(text="R6 Joint Info", icon='INFO')
+        info_box.label(text="Motor6D joints for Roblox animation")
+        info_box.label(text="Export as FBX + JSON metadata")
+        info_box.label(text="Use Roblox import script with JSON")
+
+
+class PET_PT_batch_operations(Panel):
+    """Batch operations panel for processing multiple models"""
+    bl_label = "Batch Operations"
+    bl_idname = "PET_PT_batch_operations"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        mesh_count = sum(1 for obj in context.scene.objects if obj.type == 'MESH')
+        segmented_count = sum(1 for obj in context.scene.objects 
+                            if obj.type == 'MESH' and obj.vertex_groups)
+        
+        status_box = layout.box()
+        status_box.label(text="Scene Overview", icon='SCENE_DATA')
+        status_box.label(text=f"Total meshes: {mesh_count}")
+        status_box.label(text=f"Segmented meshes: {segmented_count}")
+        
+        layout.separator()
+        
+        layout.operator("pet.list_models", text="Detect Pet Models", icon='VIEWZOOM')
+        
+        layout.separator()
+        
+        process_box = layout.box()
+        process_box.label(text="Batch Processing", icon='CON_ACTION')
+        
+        row = process_box.row()
+        op = row.operator("pet.batch_process_scene", text="Auto-Segment All")
+        op.action = 'SEGMENT'
+        
+        row = process_box.row()
+        op = row.operator("pet.batch_process_scene", text="Split All Segmented")
+        op.action = 'SPLIT'
+        
+        row = process_box.row()
+        op = row.operator("pet.batch_process_scene", text="Create All R6 Joints")
+        op.action = 'CREATE_JOINTS'
+        
+        layout.separator()
+        
+        export_box = layout.box()
+        export_box.label(text="Batch Export", icon='EXPORT')
+        
+        export_op = export_box.operator("pet.batch_export_models", text="Export All Models", icon='FILE_FOLDER')
+        
+        export_box.prop(export_op, "format", expand=True)
+        export_box.prop(export_op, "include_metadata")
+        export_box.prop(export_op, "include_r6_joints")
+        export_box.prop(export_op, "create_manifest")
+        
+        layout.separator()
+        
+        tip_box = layout.box()
+        tip_box.label(text="Workflow Tips", icon='INFO')
+        tip_box.label(text="1. Import all models into scene")
+        tip_box.label(text="2. Click 'Auto-Segment All' or use Quick Segment")
+        tip_box.label(text="3. Click 'Split All Segmented'")
+        tip_box.label(text="4. Click 'Create All R6 Joints'")
+        tip_box.label(text="5. Click 'Export All Models'")
 
 
 classes = [
@@ -625,9 +858,12 @@ classes = [
     PET_PT_main_panel,
     PET_PT_mesh_optimization,
     PET_PT_segmentation,
+    PET_PT_edge_cut_segmentation,
     PET_PT_rigging,
+    PET_PT_r6_joints,
     PET_PT_standardization,
     PET_PT_export,
+    PET_PT_batch_operations,
 ]
 
 def register():

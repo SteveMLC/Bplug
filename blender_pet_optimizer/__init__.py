@@ -25,6 +25,9 @@ modules_to_register = [
     operators.rigging,
     operators.standardization,
     operators.export,
+    operators.edge_cut_segmentation,
+    operators.roblox_r6_joints,
+    operators.batch_export,
     ui.panels,
     ui.preferences,
 ]

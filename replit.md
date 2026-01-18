@@ -1,51 +1,115 @@
 # Blender Pet Model Optimizer Plugin
 
 ## Overview
-This is a Blender addon (Python plugin) that provides mesh optimization, segmentation, and rigging tools for organic animal models. The plugin adapts proven workflows from Roblox Studio to Blender's native mesh editing, vertex groups, and armature systems.
-
-**Important**: This is NOT a web application. It's a Blender plugin that must be installed into Blender.
+A professional Blender addon for mesh optimization, segmentation, and rigging of organic animal models. Optimized for processing AI-generated 3D models (like Huanyuan) and preparing them for Roblox import with R6 joint support.
 
 ## Current State
-- Fully functional Blender addon
-- Packaging script works and creates installable zip file
-- Ready for installation into Blender 3.0+
+- Fully functional Blender addon with enhanced features
+- Edge-cut segmentation for fast batch processing
+- Roblox R6 Motor6D joint system
+- Batch export for 100+ models
+- Ready for Blender 3.0+
+
+## Key Features
+
+### Quick Segment (Edge Cuts)
+Fast workflow for batch processing:
+1. Select edge loops around appendages (head, legs, tail, wings)
+2. Mark each cut with segment name
+3. Apply - remaining mesh becomes body automatically
+
+### Roblox R6 Joints
+Motor6D-compatible pivot points:
+- Proper joint naming (Neck, LeftFrontHip, etc.)
+- C0/C1 offset transforms
+- JSON metadata export for Roblox import scripts
+- Hierarchy visualization
+
+### Batch Operations
+For processing 100+ models:
+- Auto-segment all meshes
+- Split all segmented meshes
+- Create R6 joints for all
+- Export all with manifest
+
+### Mesh Optimization
+- QEM edge collapse algorithm
+- Centroid clustering
+- UV/material/color preservation
 
 ## Project Structure
 ```
-blender_pet_optimizer/     # Main addon folder (install this in Blender)
-├── __init__.py            # Addon registration
-├── bl_info.json           # Addon metadata
-├── operators/             # Blender operators
-├── ui/                    # User interface panels
-├── utils/                 # Utility functions
-├── config/                # Configuration
-└── data/                  # Data files
+blender_pet_optimizer/
+├── __init__.py                     # Addon registration
+├── bl_info.json                    # Addon metadata
+├── operators/
+│   ├── mesh_optimizer.py           # Polygon reduction
+│   ├── segmentation.py             # Auto-segmentation
+│   ├── edge_cut_segmentation.py    # NEW: Edge-loop based cuts
+│   ├── mesh_splitter.py            # Split by vertex groups
+│   ├── roblox_r6_joints.py         # NEW: R6 joint system
+│   ├── batch_export.py             # NEW: Batch export
+│   ├── rigging.py                  # Armature creation
+│   ├── standardization.py          # Part normalization
+│   └── export.py                   # FBX/OBJ export
+├── ui/
+│   └── panels.py                   # N-panel interface
+├── utils/
+│   ├── algorithms.py               # Optimization algorithms
+│   ├── bmesh_helpers.py            # Mesh utilities
+│   └── segmentation_templates.py   # Pet type templates
+├── config/
+│   └── standards.py                # R6 joint configuration
+└── data/
+    └── body_part_labels.json       # Part naming
 
-package_addon.py           # Script to create installable zip
-package_addon.sh           # Shell wrapper
-package_addon.bat          # Windows wrapper
+package_addon.py                    # Creates installable zip
 ```
 
-## How to Use
+## Workflow for AI-Generated Models
 
-### In Replit
-Run the "Package Addon" workflow to create `blender_pet_optimizer.zip`.
+### Single Model (Manual)
+1. Import model into Blender
+2. Switch to Edit mode, select edge loops at appendage boundaries
+3. Use Quick Segment panel to mark cuts (Head, Legs, Tail, etc.)
+4. Click "Apply Cuts & Create Groups"
+5. Click "Split Into Parts"
+6. Open R6 Joints panel, click "Create R6 Joints"
+7. Export as FBX + R6 metadata JSON
 
-### Install in Blender
-1. Download the generated `blender_pet_optimizer.zip`
-2. Open Blender → Edit → Preferences → Add-ons
-3. Click "Install..." and select the zip file
-4. Enable "Pet Model Optimizer" in the addon list
-5. Access via N-panel (press N in 3D Viewport) → Pet Optimizer tab
+### Batch Processing (100+ Models)
+1. Import all models into scene
+2. Open Batch Operations panel
+3. Click "Auto-Segment All" (or manually segment each)
+4. Click "Split All Segmented"
+5. Click "Create All R6 Joints"
+6. Click "Export All Models"
 
-## Features
-- Mesh Optimization (polygon reduction)
-- Body Part Segmentation
-- Mesh Splitting
-- Rigging Preparation
-- Part Standardization
-- Roblox-compatible Export
+## Install in Blender
+1. Run "Package Addon" workflow in Replit
+2. Download `blender_pet_optimizer.zip`
+3. Open Blender → Edit → Preferences → Add-ons
+4. Click "Install..." and select the zip
+5. Enable "Pet Model Optimizer"
+6. Access via N-panel (press N) → Pet Optimizer tab
 
-## Requirements
-- Blender 3.0 or later
-- Python 3.11 (for running package script in Replit)
+## Roblox Import
+The exported JSON metadata contains:
+- Part names and dimensions
+- Motor6D joint configuration (C0, C1 transforms)
+- Attachment point positions
+
+Use with a Roblox Studio import script to create Motor6D joints automatically.
+
+## User Preferences
+- Quadruped models (dogs, cats, horses)
+- Fast edge-cut workflow preferred
+- R6 joint compatibility required for Roblox
+
+## Recent Changes
+- Added edge-loop based segment marking
+- Implemented Roblox R6 Motor6D joint system
+- Created batch processing for 100+ models
+- Enhanced UI with Quick Segment panel
+- Added R6 Joints panel with visualization
+- Added Batch Operations panel
