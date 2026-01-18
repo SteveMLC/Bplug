@@ -612,7 +612,7 @@ classes = [
     PET_OT_shrink_selection,
     PET_OT_smooth_selection_boundary,
     PET_OT_select_linked_flat,
-    PET_OT_invert_assign_body,
+    PET_OT_invert_and_assign_body,
     PET_OT_quick_decimate,
     PET_OT_preview_segments,
     PET_OT_clear_segment,

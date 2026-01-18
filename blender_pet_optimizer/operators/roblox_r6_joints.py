@@ -251,7 +251,10 @@ class PET_OT_create_r6_joints(Operator):
             
             if segment_bounds and body_bounds:
                 direction = segment_bounds['center'] - body_bounds['center']
-                direction.normalize()
+                if direction.length > 0.001:
+                    direction.normalize()
+                else:
+                    direction = Vector((0, 1, 0))
                 
                 up = Vector((0, 0, 1))
                 right = direction.cross(up)
@@ -264,8 +267,9 @@ class PET_OT_create_r6_joints(Operator):
                 joint_orientation = rot_matrix.to_euler()
             else:
                 joint_orientation = config['orientation']
+                rot_matrix = Euler(config['orientation']).to_matrix().to_4x4()
             
-            joint_world_matrix = Matrix.Translation(joint_position) @ rot_matrix if segment_bounds and body_bounds else Matrix.Translation(joint_position) @ config['orientation'].to_matrix().to_4x4()
+            joint_world_matrix = Matrix.Translation(joint_position) @ rot_matrix
             
             c0_data, c1_data = compute_c0_c1_from_parts(joint_world_matrix, body_obj, segment_obj)
             
