@@ -29,6 +29,7 @@ modules_to_register = [
     operators.roblox_r6_joints,
     operators.batch_export,
     operators.manual_segment,
+    operators.symmetry,
     ui.panels,
     ui.preferences,
 ]

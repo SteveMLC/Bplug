@@ -141,6 +141,13 @@ This preserves maximum mesh detail until the final optimization step.
 - Fixed C0/C1 transform computation to use part-local space for Motor6D compatibility
 - Updated batch export to handle unsplit models with proper manifest counts
 - Improved joint orientation calculation based on part directions
+- **NEW**: Added Roblox Studio Lua import script (roblox_import_script.lua) for automated Motor6D creation
+- **NEW**: Symmetry detection system - auto-detect X/Y/Z mirror axis
+- **NEW**: Mirror selection tool - select vertices on one side, auto-mirror to other side
+- **NEW**: Select Half tool - quickly select all vertices on positive or negative side
+- **NEW**: Symmetrize segments - copy segment assignments across symmetry axis (L↔R)
+- **NEW**: Animal preset templates (dog, cat, horse, bird, rabbit) with body proportion hints
+- **NEW**: Symmetry Tools panel in the UI with all mirror operations
 
 ## R6 Joint Data Format
 The exported JSON includes for each joint:

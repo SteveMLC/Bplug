@@ -5,8 +5,9 @@ N-panel interface for all addon operations
 
 import bpy
 from bpy.types import Panel, PropertyGroup
-from bpy.props import EnumProperty, BoolProperty, FloatProperty
+from bpy.props import EnumProperty, BoolProperty, FloatProperty, IntProperty
 from ..utils import bmesh_helpers
+from ..config.animal_presets import get_preset_names
 
 
 class PET_SegmentationSettings(PropertyGroup):
@@ -90,6 +91,30 @@ class PET_ManualAssignmentState(PropertyGroup):
         description="Count of unassigned vertices",
         default=0,
         min=0
+    )
+
+
+class PET_SymmetrySettings(PropertyGroup):
+    """PropertyGroup for symmetry tools settings"""
+    
+    def get_preset_items(self, context):
+        items = [('none', "None", "No preset - detect automatically")]
+        items.extend(get_preset_names())
+        return items
+    
+    animal_preset: EnumProperty(
+        name="Animal Type",
+        description="Select animal type for proportion hints",
+        items=get_preset_items,
+        default=0
+    )
+    
+    mirror_threshold: FloatProperty(
+        name="Mirror Threshold",
+        description="Distance threshold for matching mirrored vertices",
+        default=0.05,
+        min=0.001,
+        max=1.0
     )
 
 
@@ -966,12 +991,87 @@ class PET_PT_manual_segment(Panel):
             split_box.label(text="6. Create R6 Joints", icon='BONE_DATA')
 
 
+class PET_PT_symmetry(Panel):
+    """Symmetry detection and mirror selection tools"""
+    bl_label = "Symmetry Tools"
+    bl_idname = "PET_PT_symmetry"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        
+        if not obj or obj.type != 'MESH':
+            layout.label(text="Select a mesh object", icon='INFO')
+            return
+        
+        settings = context.scene.pet_symmetry_settings
+        
+        preset_box = layout.box()
+        preset_box.label(text="Animal Preset", icon='PRESET')
+        preset_box.prop(settings, "animal_preset", text="")
+        preset_box.label(text="Provides proportion hints for segmentation", icon='INFO')
+        
+        layout.separator()
+        
+        detect_box = layout.box()
+        detect_box.label(text="Symmetry Detection", icon='MOD_MIRROR')
+        
+        axis = obj.get("pet_symmetry_axis")
+        score = obj.get("pet_symmetry_score", 0)
+        
+        if axis:
+            detect_box.label(text=f"Detected: {axis}-axis ({score:.0%} confidence)")
+        else:
+            detect_box.label(text="Not detected yet")
+        
+        detect_box.operator("pet.detect_symmetry", text="Detect Symmetry Axis", icon='ORIENTATION_GLOBAL')
+        
+        layout.separator()
+        
+        mirror_box = layout.box()
+        mirror_box.label(text="Mirror Selection", icon='MOD_MIRROR')
+        mirror_box.prop(settings, "mirror_threshold")
+        
+        row = mirror_box.row(align=True)
+        row.operator("pet.mirror_selection", text="Mirror Selection", icon='ARROW_LEFTRIGHT')
+        
+        layout.separator()
+        
+        half_box = layout.box()
+        half_box.label(text="Select Half", icon='SELECT_INTERSECT')
+        
+        row = half_box.row(align=True)
+        op_pos = row.operator("pet.select_half", text="+ Side")
+        op_pos.side = 'POSITIVE'
+        op_neg = row.operator("pet.select_half", text="- Side")
+        op_neg.side = 'NEGATIVE'
+        
+        layout.separator()
+        
+        sym_box = layout.box()
+        sym_box.label(text="Symmetrize Segments", icon='UV_SYNC_SELECT')
+        sym_box.label(text="Copy segment assignments across axis")
+        
+        row = sym_box.row(align=True)
+        op_lr = row.operator("pet.symmetrize_segments", text="L → R")
+        op_lr.direction = 'LEFT_TO_RIGHT'
+        op_rl = row.operator("pet.symmetrize_segments", text="R → L")
+        op_rl.direction = 'RIGHT_TO_LEFT'
+
+
 classes = [
     PET_SegmentationSettings,
     PET_ManualAssignmentState,
+    PET_SymmetrySettings,
     PET_PT_main_panel,
     PET_PT_mesh_optimization,
     PET_PT_segmentation,
+    PET_PT_symmetry,
     PET_PT_manual_segment,
     PET_PT_edge_cut_segmentation,
     PET_PT_rigging,
@@ -985,16 +1085,17 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     
-    # Register PropertyGroup on Scene
     bpy.types.Scene.pet_segmentation_settings = bpy.props.PointerProperty(type=PET_SegmentationSettings)
     bpy.types.Scene.pet_manual_assignment_state = bpy.props.PointerProperty(type=PET_ManualAssignmentState)
+    bpy.types.Scene.pet_symmetry_settings = bpy.props.PointerProperty(type=PET_SymmetrySettings)
 
 def unregister():
-    # Unregister PropertyGroup from Scene
     if hasattr(bpy.types.Scene, 'pet_segmentation_settings'):
         del bpy.types.Scene.pet_segmentation_settings
     if hasattr(bpy.types.Scene, 'pet_manual_assignment_state'):
         del bpy.types.Scene.pet_manual_assignment_state
+    if hasattr(bpy.types.Scene, 'pet_symmetry_settings'):
+        del bpy.types.Scene.pet_symmetry_settings
     
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
