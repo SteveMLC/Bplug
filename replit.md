@@ -105,6 +105,16 @@ Use with a Roblox Studio import script to create Motor6D joints automatically.
 - Quadruped models (dogs, cats, horses)
 - Fast edge-cut workflow preferred
 - R6 joint compatibility required for Roblox
+- Large meshes: 300k+ vertices require timeout handling
+
+## Performance & Timeout Handling
+For large meshes (300k+ vertices):
+- Progress bar displays during expensive operations
+- 30-second default timeout per operation
+- 60-second timeout per segment during splitting
+- Chunk processing (50k vertices at a time)
+- Graceful partial completion on timeout
+- Recommendation: Use Quick Decimate first to reduce complexity
 
 ## Recent Changes
 - Added Manual Segment panel for hands-on vertex selection workflow

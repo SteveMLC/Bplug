@@ -2,6 +2,35 @@ import bpy
 from bpy.types import Operator
 from bpy.props import StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty
 import bmesh
+import time
+
+
+MAX_VERTS_DIRECT = 100000
+CHUNK_SIZE = 50000
+TIMEOUT_SECONDS = 30
+
+
+def process_in_chunks(vertices, chunk_size, process_func, context=None, timeout=TIMEOUT_SECONDS):
+    """Process vertices in chunks with timeout handling and progress updates"""
+    start_time = time.time()
+    total = len(vertices)
+    processed = 0
+    results = []
+    
+    for i in range(0, total, chunk_size):
+        if time.time() - start_time > timeout:
+            return results, processed, True
+        
+        chunk = vertices[i:i + chunk_size]
+        chunk_result = process_func(chunk)
+        if chunk_result:
+            results.extend(chunk_result)
+        processed += len(chunk)
+        
+        if context and hasattr(context, 'window_manager'):
+            context.window_manager.progress_update(processed / total * 100)
+    
+    return results, processed, False
 
 
 class PET_OT_assign_selection_to_segment(Operator):
@@ -20,6 +49,8 @@ class PET_OT_assign_selection_to_segment(Operator):
         return context.window_manager.invoke_props_dialog(self)
     
     def execute(self, context):
+        start_time = time.time()
+        
         obj = context.active_object
         if not obj or obj.type != 'MESH':
             self.report({'ERROR'}, "Select a mesh object")
@@ -30,9 +61,15 @@ class PET_OT_assign_selection_to_segment(Operator):
             return {'CANCELLED'}
         
         bm = bmesh.from_edit_mesh(obj.data)
+        
+        if len(bm.verts) > MAX_VERTS_DIRECT:
+            context.window_manager.progress_begin(0, 100)
+        
         selected_verts = [v for v in bm.verts if v.select]
         
         if not selected_verts:
+            if len(bm.verts) > MAX_VERTS_DIRECT:
+                context.window_manager.progress_end()
             self.report({'ERROR'}, "No vertices selected")
             return {'CANCELLED'}
         
@@ -45,11 +82,26 @@ class PET_OT_assign_selection_to_segment(Operator):
             vg = obj.vertex_groups.new(name=group_name)
         
         vert_indices = [v.index for v in selected_verts]
-        vg.add(vert_indices, 1.0, 'REPLACE')
+        
+        if len(vert_indices) > CHUNK_SIZE:
+            for i in range(0, len(vert_indices), CHUNK_SIZE):
+                if time.time() - start_time > TIMEOUT_SECONDS:
+                    self.report({'WARNING'}, f"Timeout after {i:,} vertices. Partial assignment completed.")
+                    break
+                chunk = vert_indices[i:i + CHUNK_SIZE]
+                vg.add(chunk, 1.0, 'REPLACE')
+                if len(bm.verts) > MAX_VERTS_DIRECT:
+                    context.window_manager.progress_update((i / len(vert_indices)) * 100)
+        else:
+            vg.add(vert_indices, 1.0, 'REPLACE')
+        
+        if len(bm.verts) > MAX_VERTS_DIRECT:
+            context.window_manager.progress_end()
         
         bpy.ops.object.mode_set(mode='EDIT')
         
-        self.report({'INFO'}, f"Assigned {len(vert_indices)} vertices to '{self.segment_name}'")
+        elapsed = time.time() - start_time
+        self.report({'INFO'}, f"Assigned {len(vert_indices):,} vertices to '{self.segment_name}' ({elapsed:.1f}s)")
         return {'FINISHED'}
 
 
@@ -207,42 +259,85 @@ class PET_OT_invert_and_assign_body(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
+        start_time = time.time()
+        
         obj = context.active_object
         if not obj or obj.type != 'MESH':
             self.report({'ERROR'}, "Select a mesh object")
             return {'CANCELLED'}
         
+        total_verts = len(obj.data.vertices)
+        use_progress = total_verts > MAX_VERTS_DIRECT
+        
+        if use_progress:
+            context.window_manager.progress_begin(0, 100)
+            self.report({'INFO'}, f"Processing {total_verts:,} vertices...")
+        
         if obj.mode != 'EDIT':
             bpy.ops.object.mode_set(mode='EDIT')
         
         bpy.ops.mesh.select_all(action='SELECT')
-        
         bpy.ops.object.mode_set(mode='OBJECT')
         
         segment_groups = [vg for vg in obj.vertex_groups if vg.name.startswith("Segment_")]
         
         assigned_verts = set()
+        processed = 0
+        
         for vg in segment_groups:
             if vg.name == "Segment_Body":
                 continue
             vg_index = vg.index
-            for v in obj.data.vertices:
+            
+            for i, v in enumerate(obj.data.vertices):
+                if time.time() - start_time > TIMEOUT_SECONDS:
+                    if use_progress:
+                        context.window_manager.progress_end()
+                    self.report({'WARNING'}, f"Timeout after processing {processed:,} vertices. Try on decimated mesh.")
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    return {'CANCELLED'}
+                
                 for g in v.groups:
                     if g.group == vg_index and g.weight > 0.5:
                         assigned_verts.add(v.index)
+                
+                if use_progress and i % 10000 == 0:
+                    context.window_manager.progress_update((i / total_verts) * 50)
+            
+            processed = len(assigned_verts)
+        
+        if use_progress:
+            context.window_manager.progress_update(60)
         
         body_verts = [v.index for v in obj.data.vertices if v.index not in assigned_verts]
+        
+        if use_progress:
+            context.window_manager.progress_update(70)
         
         if "Segment_Body" in obj.vertex_groups:
             body_group = obj.vertex_groups["Segment_Body"]
         else:
             body_group = obj.vertex_groups.new(name="Segment_Body")
         
-        body_group.add(body_verts, 1.0, 'REPLACE')
+        if len(body_verts) > CHUNK_SIZE:
+            for i in range(0, len(body_verts), CHUNK_SIZE):
+                if time.time() - start_time > TIMEOUT_SECONDS:
+                    self.report({'WARNING'}, f"Timeout during body assignment. Partial completion.")
+                    break
+                chunk = body_verts[i:i + CHUNK_SIZE]
+                body_group.add(chunk, 1.0, 'REPLACE')
+                if use_progress:
+                    context.window_manager.progress_update(70 + (i / len(body_verts)) * 30)
+        else:
+            body_group.add(body_verts, 1.0, 'REPLACE')
+        
+        if use_progress:
+            context.window_manager.progress_end()
         
         bpy.ops.object.mode_set(mode='EDIT')
         
-        self.report({'INFO'}, f"Assigned {len(body_verts)} vertices to Body ({len(assigned_verts)} in other segments)")
+        elapsed = time.time() - start_time
+        self.report({'INFO'}, f"Assigned {len(body_verts):,} vertices to Body ({len(assigned_verts):,} in other segments) - {elapsed:.1f}s")
         return {'FINISHED'}
 
 
@@ -303,6 +398,8 @@ class PET_OT_preview_segments(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
+        start_time = time.time()
+        
         obj = context.active_object
         if not obj or obj.type != 'MESH':
             self.report({'ERROR'}, "Select a mesh object")
@@ -310,6 +407,14 @@ class PET_OT_preview_segments(Operator):
         
         if obj.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
+        
+        total_verts = len(obj.data.vertices)
+        total_loops = len(obj.data.loops)
+        use_progress = total_verts > MAX_VERTS_DIRECT
+        
+        if use_progress:
+            context.window_manager.progress_begin(0, 100)
+            self.report({'INFO'}, f"Building preview for {total_verts:,} vertices...")
         
         if not obj.data.vertex_colors:
             obj.data.vertex_colors.new(name="SegmentPreview")
@@ -333,19 +438,40 @@ class PET_OT_preview_segments(Operator):
             if vg.name.startswith("Segment_"):
                 segment_name = vg.name[8:]
                 vg_index = vg.index
-                for v in obj.data.vertices:
+                for i, v in enumerate(obj.data.vertices):
+                    if use_progress and i % 20000 == 0:
+                        if time.time() - start_time > TIMEOUT_SECONDS:
+                            context.window_manager.progress_end()
+                            self.report({'WARNING'}, "Timeout building segment map. Try on smaller mesh.")
+                            return {'CANCELLED'}
+                        context.window_manager.progress_update((i / total_verts) * 50)
+                    
                     for g in v.groups:
                         if g.group == vg_index and g.weight > 0.5:
                             vert_segment[v.index] = segment_name
         
-        for poly in obj.data.polygons:
+        if use_progress:
+            context.window_manager.progress_update(50)
+        
+        default_color = (0.5, 0.5, 0.5, 1.0)
+        for i, poly in enumerate(obj.data.polygons):
+            if use_progress and i % 10000 == 0:
+                if time.time() - start_time > TIMEOUT_SECONDS:
+                    context.window_manager.progress_end()
+                    self.report({'WARNING'}, "Timeout coloring polygons. Partial preview available.")
+                    break
+                context.window_manager.progress_update(50 + (i / len(obj.data.polygons)) * 50)
+            
             for loop_index in poly.loop_indices:
                 vert_index = obj.data.loops[loop_index].vertex_index
                 segment = vert_segment.get(vert_index, None)
                 if segment and segment in segment_colors:
                     color_layer.data[loop_index].color = segment_colors[segment]
                 else:
-                    color_layer.data[loop_index].color = (0.5, 0.5, 0.5, 1.0)
+                    color_layer.data[loop_index].color = default_color
+        
+        if use_progress:
+            context.window_manager.progress_end()
         
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
@@ -354,7 +480,8 @@ class PET_OT_preview_segments(Operator):
                         space.shading.type = 'SOLID'
                         space.shading.color_type = 'VERTEX'
         
-        self.report({'INFO'}, f"Previewing {len(vert_segment)} vertices across segments")
+        elapsed = time.time() - start_time
+        self.report({'INFO'}, f"Previewing {len(vert_segment):,} vertices across segments ({elapsed:.1f}s)")
         return {'FINISHED'}
 
 
@@ -385,7 +512,17 @@ class PET_OT_split_by_segments(Operator):
     bl_label = "Split by Segments"
     bl_options = {'REGISTER', 'UNDO'}
     
+    timeout_per_segment: IntProperty(
+        name="Timeout per Segment",
+        description="Maximum seconds per segment split (0 = no limit)",
+        default=60,
+        min=0,
+        max=300
+    )
+    
     def execute(self, context):
+        start_time = time.time()
+        
         obj = context.active_object
         if not obj or obj.type != 'MESH':
             self.report({'ERROR'}, "Select a mesh object")
@@ -400,11 +537,23 @@ class PET_OT_split_by_segments(Operator):
         if obj.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         
+        total_verts = len(obj.data.vertices)
+        use_progress = total_verts > MAX_VERTS_DIRECT
+        
+        if use_progress:
+            context.window_manager.progress_begin(0, 100)
+            self.report({'INFO'}, f"Splitting {total_verts:,} vertex mesh into {len(segment_groups)} segments...")
+        
         base_name = obj.name
         created_objects = []
+        segment_timeout = self.timeout_per_segment if self.timeout_per_segment > 0 else 300
         
-        for vg in segment_groups:
+        for seg_idx, vg in enumerate(segment_groups):
+            segment_start = time.time()
             segment_name = vg.name[8:]
+            
+            if use_progress:
+                context.window_manager.progress_update((seg_idx / len(segment_groups)) * 100)
             
             bpy.ops.object.select_all(action='DESELECT')
             obj.select_set(True)
@@ -418,13 +567,24 @@ class PET_OT_split_by_segments(Operator):
             bpy.ops.object.mode_set(mode='OBJECT')
             
             vg_index = new_obj.vertex_groups[vg.name].index
-            for v in new_obj.data.vertices:
+            timed_out = False
+            
+            for i, v in enumerate(new_obj.data.vertices):
+                if i % 10000 == 0 and time.time() - segment_start > segment_timeout:
+                    self.report({'WARNING'}, f"Timeout splitting '{segment_name}'. Skipping.")
+                    timed_out = True
+                    break
+                
                 in_group = False
                 for g in v.groups:
                     if g.group == vg_index and g.weight > 0.5:
                         in_group = True
                         break
                 v.select = not in_group
+            
+            if timed_out:
+                bpy.data.objects.remove(new_obj, do_unlink=True)
+                continue
             
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.delete(type='VERT')
@@ -435,9 +595,13 @@ class PET_OT_split_by_segments(Operator):
             
             created_objects.append(new_obj.name)
         
+        if use_progress:
+            context.window_manager.progress_end()
+        
         bpy.data.objects.remove(obj, do_unlink=True)
         
-        self.report({'INFO'}, f"Created {len(created_objects)} segment objects: {', '.join(created_objects)}")
+        elapsed = time.time() - start_time
+        self.report({'INFO'}, f"Created {len(created_objects)} segment objects in {elapsed:.1f}s")
         return {'FINISHED'}
 
 
