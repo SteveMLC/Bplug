@@ -584,6 +584,19 @@ class PET_OT_auto_grow_current_selection(Operator):
         have_time = (time.time() - start_time) < TIMEOUT_SECONDS
         if have_time:
             max_total = max_part_vertices if part_type != 'body' else None
+            
+            # Get vertices already assigned to other parts (to exclude from gap filling)
+            excluded_verts = set()
+            mesh = obj.data
+            for other_vg in obj.vertex_groups:
+                if other_vg.name != part_type and other_vg.name != 'body':
+                    vg_index = other_vg.index
+                    for vert in mesh.vertices:
+                        for group in vert.groups:
+                            if group.group == vg_index and group.weight > 0.5:
+                                excluded_verts.add(vert.index)
+                                break
+            
             try:
                 expanded = fill_small_surrounded_gaps(
                     bm,
@@ -598,6 +611,7 @@ class PET_OT_auto_grow_current_selection(Operator):
                     max_total_vertices=max_total,
                     start_time=start_time,
                     timeout_seconds=TIMEOUT_SECONDS,
+                    excluded_indices=excluded_verts,  # Don't include vertices from other parts
                 )
             except Exception as e:
                 print(f"[PET_OT_auto_grow_current_selection] gap-fill error for part '{part_type}': {e}")
@@ -672,12 +686,49 @@ class PET_OT_save_part_selection(Operator):
         mesh = obj.data
         bm = bmesh.from_edit_mesh(mesh)
         bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
         
-        selected_verts = [v.index for v in bm.verts if v.select]
+        selected_verts = set(v.index for v in bm.verts if v.select)
         
         if not selected_verts:
             self.report({'WARNING'}, "No vertices selected. Select vertices before saving.")
             return {'CANCELLED'}
+        
+        # Get vertices already assigned to other parts (to exclude from gap filling)
+        excluded_verts = set()
+        for other_vg in obj.vertex_groups:
+            if other_vg.name != current_part:
+                vg_index = other_vg.index
+                for vert in mesh.vertices:
+                    for group in vert.groups:
+                        if group.group == vg_index and group.weight > 0.5:
+                            excluded_verts.add(vert.index)
+                            break
+        
+        # Fill surrounded gaps to ensure all vertices inside the selection boundary are included
+        # Use aggressive parameters to catch all internal vertices
+        start_time = time.time()
+        try:
+            filled_verts = fill_small_surrounded_gaps(
+                bm,
+                selected_verts,
+                max_gap_size=512,  # Allow larger gaps to be filled
+                neighbor_selected_ratio=0.75,  # More lenient - allow 25% external neighbors
+                max_total_vertices=None,  # No limit - fill all gaps
+                start_time=start_time,
+                timeout_seconds=5.0,  # 5 second timeout
+                excluded_indices=excluded_verts,  # Don't include vertices from other parts
+                use_component_level_check=True,  # Use two-tier check for better accuracy
+            )
+            selected_verts = filled_verts
+        except Exception as e:
+            print(f"[PET_OT_save_part_selection] Gap filling error: {e}")
+            # Continue with original selection if gap filling fails
+            selected_verts = set(selected_verts)
+        
+        # Convert back to list for vertex group assignment
+        selected_verts = list(selected_verts)
         
         # Switch to Object mode to modify vertex groups
         bpy.ops.object.mode_set(mode='OBJECT')

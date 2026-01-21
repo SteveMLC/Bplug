@@ -487,7 +487,78 @@ class PET_OT_split_by_vertex_groups(Operator):
             
             # CRITICAL: Store mesh reference before splitting - original mesh gets modified
             # We need to work with a fresh reference each time
+            
+            # Sort vertex groups: process body FIRST to ensure it captures all vertices
+            # within its spatial boundary before appendages claim them
+            vertex_groups_list = list(obj.vertex_groups)
+            body_names = {'body', 'torso', 'core', 'Body', 'Torso', 'Core', 'BODY', 'TORSO', 'CORE'}
+            
+            def get_processing_priority(vg):
+                """Return 0 for body (process first), 1 for others"""
+                return 0 if vg.name in body_names else 1
+            
+            # Sort: body groups first (priority 0), then others (priority 1)
+            vertex_groups_list.sort(key=get_processing_priority)
+            
+            # CRITICAL: Calculate body spatial boundaries BEFORE any splitting
+            # Body vertices will be removed after split, so we need original mesh state
+            stored_body_boundaries = {}
+            
+            # Create temporary bmesh from original mesh to calculate boundaries
+            temp_bm = bmesh.new()
+            temp_bm.from_mesh(mesh)
+            temp_bm.verts.ensure_lookup_table()
+            
+            # Calculate body boundaries from original mesh
             for vg in obj.vertex_groups:
+                vg_name_lower = vg.name.lower()
+                
+                # Only include body parts
+                if vg.name not in body_names and vg_name_lower not in {n.lower() for n in body_names}:
+                    continue
+                
+                # Get vertices in this body group from original mesh
+                vg_index = vg.index
+                body_vertices = []
+                for vertex in mesh.vertices:  # Original mesh, not modified
+                    for group in vertex.groups:
+                        if group.group == vg_index and group.weight > 0.5:
+                            body_vertices.append(vertex.index)
+                            break
+                
+                if not body_vertices:
+                    continue
+                
+                # Calculate bounding box for this body part
+                bbox_min = None
+                bbox_max = None
+                for vert_idx in body_vertices:
+                    if vert_idx >= len(temp_bm.verts):
+                        continue
+                    vert_co = temp_bm.verts[vert_idx].co
+                    
+                    if bbox_min is None:
+                        bbox_min = Vector(vert_co)
+                        bbox_max = Vector(vert_co)
+                    else:
+                        bbox_min.x = min(bbox_min.x, vert_co.x)
+                        bbox_min.y = min(bbox_min.y, vert_co.y)
+                        bbox_min.z = min(bbox_min.z, vert_co.z)
+                        bbox_max.x = max(bbox_max.x, vert_co.x)
+                        bbox_max.y = max(bbox_max.y, vert_co.y)
+                        bbox_max.z = max(bbox_max.z, vert_co.z)
+                
+                if bbox_min is not None and bbox_max is not None:
+                    # Expand boundary by same factor (0.015) for consistency
+                    bbox_size = bbox_max - bbox_min
+                    expand_amount = bbox_size * 0.015
+                    expanded_min = bbox_min - expand_amount
+                    expanded_max = bbox_max + expand_amount
+                    stored_body_boundaries[vg.name] = (expanded_min, expanded_max)
+            
+            temp_bm.free()
+            
+            for vg in vertex_groups_list:
                 # Re-acquire the original object reference (it may have been deselected)
                 # Find it by name if context lost reference
                 original_obj = None
@@ -551,7 +622,8 @@ class PET_OT_split_by_vertex_groups(Operator):
                 # This captures isolated vertices that are inside the segment boundary
                 # Respects boundaries of other segments (excludes vertices in other groups)
                 vertex_mask = self._include_vertices_within_spatial_boundary(
-                    original_obj, vg.name, bm, vertex_mask, current_mesh, expansion_factor=0.015
+                    original_obj, vg.name, bm, vertex_mask, current_mesh, expansion_factor=0.015,
+                    stored_body_boundaries=stored_body_boundaries if vg.name not in body_names else None
                 )
                 
                 # CRITICAL: Identify separation boundary edges BEFORE splitting
@@ -781,7 +853,143 @@ class PET_OT_split_by_vertex_groups(Operator):
         
         return expanded_mask
     
-    def _include_vertices_within_spatial_boundary(self, obj, vertex_group_name, bm, vertex_mask, mesh, expansion_factor=0.015):
+    def _get_appendage_spatial_boundaries(self, obj, bm, mesh, body_names):
+        """
+        Calculate spatial boundaries (bounding boxes) for all appendage vertex groups.
+        Returns dict mapping appendage group names to (bbox_min, bbox_max) tuples.
+        
+        Args:
+            obj: Blender object with mesh data
+            bm: bmesh object
+            mesh: Blender mesh data
+            body_names: Set of body part names to exclude from appendages
+        
+        Returns:
+            dict: {appendage_name: (bbox_min, bbox_max), ...}
+        """
+        appendage_boundaries = {}
+        
+        # Define appendage part patterns
+        appendage_patterns = ['head', 'leg', 'arm', 'tail', 'wing', 'foot', 'hand']
+        
+        for vg in obj.vertex_groups:
+            vg_name_lower = vg.name.lower()
+            
+            # Skip if this is a body part
+            if vg.name in body_names or vg_name_lower in {n.lower() for n in body_names}:
+                continue
+            
+            # Check if this is an appendage (contains any appendage pattern)
+            is_appendage = any(pattern in vg_name_lower for pattern in appendage_patterns)
+            if not is_appendage:
+                continue
+            
+            # Get vertices in this appendage group
+            vg_index = vg.index
+            appendage_vertices = []
+            for vertex in mesh.vertices:
+                for group in vertex.groups:
+                    if group.group == vg_index and group.weight > 0.5:
+                        appendage_vertices.append(vertex.index)
+                        break
+            
+            if not appendage_vertices:
+                continue
+            
+            # Calculate bounding box for this appendage
+            bbox_min = None
+            bbox_max = None
+            for vert_idx in appendage_vertices:
+                if vert_idx >= len(bm.verts):
+                    continue
+                vert_co = bm.verts[vert_idx].co
+                
+                if bbox_min is None:
+                    bbox_min = Vector(vert_co)
+                    bbox_max = Vector(vert_co)
+                else:
+                    bbox_min.x = min(bbox_min.x, vert_co.x)
+                    bbox_min.y = min(bbox_min.y, vert_co.y)
+                    bbox_min.z = min(bbox_min.z, vert_co.z)
+                    bbox_max.x = max(bbox_max.x, vert_co.x)
+                    bbox_max.y = max(bbox_max.y, vert_co.y)
+                    bbox_max.z = max(bbox_max.z, vert_co.z)
+            
+            if bbox_min is not None and bbox_max is not None:
+                # Expand boundary by same factor (0.015) for consistency
+                bbox_size = bbox_max - bbox_min
+                expand_amount = bbox_size * 0.015
+                expanded_min = bbox_min - expand_amount
+                expanded_max = bbox_max + expand_amount
+                appendage_boundaries[vg.name] = (expanded_min, expanded_max)
+        
+        return appendage_boundaries
+    
+    def _get_body_spatial_boundaries(self, obj, bm, mesh, body_names):
+        """
+        Calculate spatial boundaries (bounding boxes) for body vertex groups.
+        Returns dict mapping body group names to (bbox_min, bbox_max) tuples.
+        
+        Args:
+            obj: Blender object with mesh data
+            bm: bmesh object
+            mesh: Blender mesh data
+            body_names: Set of body part names
+        
+        Returns:
+            dict: {body_name: (bbox_min, bbox_max), ...}
+        """
+        body_boundaries = {}
+        
+        for vg in obj.vertex_groups:
+            vg_name_lower = vg.name.lower()
+            
+            # Only include body parts
+            if vg.name not in body_names and vg_name_lower not in {n.lower() for n in body_names}:
+                continue
+            
+            # Get vertices in this body group
+            vg_index = vg.index
+            body_vertices = []
+            for vertex in mesh.vertices:
+                for group in vertex.groups:
+                    if group.group == vg_index and group.weight > 0.5:
+                        body_vertices.append(vertex.index)
+                        break
+            
+            if not body_vertices:
+                continue
+            
+            # Calculate bounding box for this body part
+            bbox_min = None
+            bbox_max = None
+            for vert_idx in body_vertices:
+                if vert_idx >= len(bm.verts):
+                    continue
+                vert_co = bm.verts[vert_idx].co
+                
+                if bbox_min is None:
+                    bbox_min = Vector(vert_co)
+                    bbox_max = Vector(vert_co)
+                else:
+                    bbox_min.x = min(bbox_min.x, vert_co.x)
+                    bbox_min.y = min(bbox_min.y, vert_co.y)
+                    bbox_min.z = min(bbox_min.z, vert_co.z)
+                    bbox_max.x = max(bbox_max.x, vert_co.x)
+                    bbox_max.y = max(bbox_max.y, vert_co.y)
+                    bbox_max.z = max(bbox_max.z, vert_co.z)
+            
+            if bbox_min is not None and bbox_max is not None:
+                # Expand boundary by same factor (0.015) for consistency
+                bbox_size = bbox_max - bbox_min
+                expand_amount = bbox_size * 0.015
+                expanded_min = bbox_min - expand_amount
+                expanded_max = bbox_max + expand_amount
+                body_boundaries[vg.name] = (expanded_min, expanded_max)
+        
+        return body_boundaries
+    
+    def _include_vertices_within_spatial_boundary(self, obj, vertex_group_name, bm, vertex_mask, mesh, expansion_factor=0.015, stored_body_boundaries=None):
         """
         Include all vertices within the spatial boundary (bounding box) of the vertex group.
         Expands boundary by a small percentage (1-2%) to catch outliers, but excludes vertices
@@ -847,6 +1055,56 @@ class PET_OT_split_by_vertex_groups(Operator):
                 for group in vertex.groups:
                     if group.group == other_vg_index and group.weight > 0.5:
                         excluded_indices.add(vertex.index)
+                        break
+        
+        # ADDITIONAL: If processing body, exclude vertices within appendage spatial boundaries
+        body_names = {'body', 'torso', 'core', 'Body', 'Torso', 'Core', 'BODY', 'TORSO', 'CORE'}
+        if vertex_group_name in body_names:
+            appendage_boundaries = self._get_appendage_spatial_boundaries(obj, bm, mesh, body_names)
+            
+            for vert_idx, vert in enumerate(bm.verts):
+                if vert_idx in excluded_indices:
+                    continue
+                
+                vert_co = vert.co
+                # Check if vertex is within any appendage's spatial boundary
+                for appendage_name, (app_bbox_min, app_bbox_max) in appendage_boundaries.items():
+                    inside_appendage = (
+                        app_bbox_min.x <= vert_co.x <= app_bbox_max.x and
+                        app_bbox_min.y <= vert_co.y <= app_bbox_max.y and
+                        app_bbox_min.z <= vert_co.z <= app_bbox_max.z
+                    )
+                    if inside_appendage:
+                        excluded_indices.add(vert_idx)
+                        break
+        
+        # ADDITIONAL: If processing appendage, exclude vertices within body spatial boundaries
+        appendage_patterns = ['head', 'leg', 'arm', 'tail', 'wing', 'foot', 'hand']
+        vg_name_lower = vertex_group_name.lower()
+        is_appendage = any(pattern in vg_name_lower for pattern in appendage_patterns)
+        
+        if is_appendage and vertex_group_name not in body_names:
+            # Use stored boundaries if available (calculated from original mesh)
+            # Otherwise fall back to calculating from current mesh (shouldn't happen)
+            if stored_body_boundaries:
+                body_boundaries = stored_body_boundaries
+            else:
+                body_boundaries = self._get_body_spatial_boundaries(obj, bm, mesh, body_names)
+            
+            for vert_idx, vert in enumerate(bm.verts):
+                if vert_idx in excluded_indices:
+                    continue
+                
+                vert_co = vert.co
+                # Check if vertex is within any body's spatial boundary
+                for body_name, (body_bbox_min, body_bbox_max) in body_boundaries.items():
+                    inside_body = (
+                        body_bbox_min.x <= vert_co.x <= body_bbox_max.x and
+                        body_bbox_min.y <= vert_co.y <= body_bbox_max.y and
+                        body_bbox_min.z <= vert_co.z <= body_bbox_max.z
+                    )
+                    if inside_body:
+                        excluded_indices.add(vert_idx)
                         break
         
         # Test all mesh vertices against expanded spatial boundary
