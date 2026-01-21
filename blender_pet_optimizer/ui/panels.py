@@ -189,6 +189,43 @@ class PET_ManualPartSelectionState(PropertyGroup):
     )
 
 
+class PET_LowPolySettings(PropertyGroup):
+    """PropertyGroup for low-poly prep settings stored on Scene"""
+    
+    step_reduction: FloatProperty(
+        name="Step Reduction",
+        description="Gentle face reduction per step (0.0-0.5)",
+        default=0.1,
+        min=0.01,
+        max=0.5,
+        subtype='FACTOR',
+    )
+    
+    algorithm: EnumProperty(
+        name="Algorithm",
+        description="Decimation algorithm for low-poly prep",
+        items=[
+            ('AUTO', "Auto", "Automatically select best algorithm based on mesh"),
+            ('QEM', "QEM Edge Collapse", "Quadric Error Metric edge collapse"),
+            ('CENTROID', "Centroid Clustering", "Centroid clustering decimation"),
+        ],
+        default='AUTO',
+    )
+    
+    preserve_sharp_features: BoolProperty(
+        name="Preserve Sharp Features",
+        description="Prefer to keep seams, creases, and borders when reducing polygons",
+        default=True,
+    )
+    
+    max_faces: IntProperty(
+        name="Target Max Faces",
+        description="Optional target face count to stop at (0 = ignore)",
+        default=0,
+        min=0,
+    )
+
+
 class PET_PT_main_panel(Panel):
     """Main panel for Pet Model Optimizer"""
     bl_label = "Pet Model Optimizer"
@@ -230,7 +267,58 @@ class PET_PT_mesh_optimization(Panel):
         face_count = len(obj.data.polygons) if obj.data.polygons else 0
         layout.label(text=f"Faces: {face_count:,}", icon='MESH_DATA')
         
-        # Algorithm selection
+        # Low-Poly Prep (pre-segmentation gentle decimation)
+        lowpoly_settings = getattr(scene, "pet_lowpoly_settings", None)
+        if lowpoly_settings:
+            lp_box = layout.box()
+            lp_box.label(text="Low-Poly Prep (Before Segmentation)", icon='MOD_DECIM')
+            
+            # Show cumulative stats if available
+            initial_faces = obj.get("pet_lowpoly_initial_faces", 0)
+            last_faces = obj.get("pet_lowpoly_last_faces", 0)
+            total_reduction = obj.get("pet_lowpoly_total_reduction", 0.0)
+            
+            if initial_faces and last_faces:
+                lp_box.label(
+                    text=f"From {initial_faces:,} to {last_faces:,} faces "
+                         f"({total_reduction * 100.0:.1f}% total reduction)",
+                    icon='INFO',
+                )
+            else:
+                lp_box.label(text="Use gentle steps before cutting/splitting.", icon='INFO')
+            
+            # Settings
+            lp_box.prop(lowpoly_settings, "step_reduction", slider=True)
+            lp_box.prop(lowpoly_settings, "algorithm")
+            lp_box.prop(lowpoly_settings, "preserve_sharp_features")
+            lp_box.prop(lowpoly_settings, "max_faces")
+            
+            # Actions
+            row = lp_box.row(align=True)
+            row.scale_y = 1.2
+            preview_op = row.operator(
+                "pet.lowpoly_prep",
+                text="Preview Low-Poly",
+                icon='HIDE_OFF',
+            )
+            preview_op.mode = 'PREVIEW'
+            
+            apply_op = row.operator(
+                "pet.lowpoly_prep",
+                text="Apply Step",
+                icon='CHECKMARK',
+            )
+            apply_op.mode = 'APPLY'
+            
+            lp_box.label(
+                text="Start with small steps, preview, then iterate until the mesh is comfortable to work with.",
+                icon='INFO',
+            )
+            
+            layout.separator()
+        
+        # Advanced optimizer (more aggressive / manual control)
+        layout.label(text="Advanced Optimization", icon='MODIFIER')
         op = layout.operator("pet.optimize_mesh", text="Optimize Mesh")
         
         col = layout.column()
@@ -238,6 +326,7 @@ class PET_PT_mesh_optimization(Panel):
         
         # Reduction slider
         layout.prop(op, "reduction", slider=True)
+        layout.prop(op, "preserve_sharp_features")
         
         # Grid size (only for centroid clustering)
         if op.algorithm in ['AUTO', 'CENTROID']:
@@ -590,21 +679,101 @@ class PET_PT_segmentation(Panel):
             adjust_box.label(text="3. Use Blender's paint tools to modify")
             adjust_box.label(text="4. Or use Edit mode + Select → Select by Vertex Group")
             layout.separator()
+
+
+class PET_PT_split(Panel):
+    """Split panel - split segmented mesh into separate objects"""
+    bl_label = "Split"
+    bl_idname = "PET_PT_split"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
         
-        # ===== Split Options (if vertex groups exist) =====
-        if obj.vertex_groups:
-            split_box = layout.box()
-            split_box.label(text="Split Options", icon='OUTLINER_OB_MESH')
-            split_box.label(text="Ready to split? Make sure segmentation looks good first!")
-            split_op = split_box.operator("pet.split_by_vertex_groups", text="Split Manually", icon='MODIFIER_ON')
-            split_op.create_pivots = True
-            split_op.keep_original = True
-            split_op.verify_data = True
-            split_box.prop(split_op, "keep_original")
-            split_box.prop(split_op, "verify_data")
-            split_box.prop(split_op, "create_pivots")
+        if not obj or obj.type != 'MESH':
+            layout.label(text="Select a mesh object", icon='INFO')
+            return
+        
+        if not obj.vertex_groups:
+            info_box = layout.box()
+            info_box.label(text="No vertex groups found", icon='INFO')
+            info_box.label(text="Segment your model first using:")
+            info_box.label(text="• Segmentation panel")
+            info_box.label(text="• Quick Segment (Edge Cuts)")
+            info_box.label(text="• Manual Part Segmentation")
+            return
+        
+        # ===== Status Info =====
+        status_box = layout.box()
+        status_box.label(text="Status", icon='INFO')
+        status_box.label(text=f"Vertex Groups: {len(obj.vertex_groups)}")
+        
+        # List vertex groups
+        vg_list = status_box.column(align=True)
+        for vg in obj.vertex_groups:
+            # Count vertices in this group
+            vert_count = 0
+            for v in obj.data.vertices:
+                for g in v.groups:
+                    if g.group == vg.index and g.weight > 0.0:
+                        vert_count += 1
+                        break
             
-            layout.separator()
+            row = vg_list.row(align=True)
+            if vert_count > 0:
+                row.label(text=f"  ✓ {vg.name}: {vert_count:,} vertices", icon='CHECKMARK')
+            else:
+                row.label(text=f"  ✗ {vg.name}: 0 vertices (empty)", icon='ERROR')
+        
+        layout.separator()
+        
+        # ===== Split Options =====
+        split_box = layout.box()
+        split_box.label(text="Split Into Parts", icon='MODIFIER_ON')
+        split_box.label(text="Ready to split? Make sure segmentation looks good first!", icon='INFO')
+        
+        split_op = split_box.operator("pet.split_by_vertex_groups", text="Split Into Parts", icon='MODIFIER_ON')
+        split_op.create_pivots = True
+        split_op.keep_original = True
+        split_op.verify_data = True
+        
+        split_box.separator()
+        
+        # Options
+        split_box.prop(split_op, "keep_original", text="Keep Original Mesh")
+        split_box.prop(split_op, "verify_data", text="Verify Data Preservation")
+        
+        split_box.separator()
+        
+        split_box.prop(split_op, "gap_distance", slider=True)
+        split_box.label(text="Gap: Creates space between parts for workflow", icon='INFO')
+        split_box.label(text="(Makes cut edges accessible for smoothing/filling)")
+        
+        split_box.separator()
+        
+        split_box.prop(split_op, "create_pivots", text="Create Pivot Points")
+        split_box.label(text="⚠️ Pivots calculated BEFORE gaps (for R6 joints)", icon='ERROR')
+        
+        layout.separator()
+        
+        # ===== What Happens Info =====
+        info_box = layout.box()
+        info_box.label(text="What Happens When You Split:", icon='INFO')
+        info_box.label(text="1. Pivot positions calculated (from vertex group boundaries)")
+        info_box.label(text="2. Mesh split into separate objects")
+        info_box.label(text="3. Gaps created between parts (workflow convenience)")
+        info_box.label(text="4. Pivot markers created (for visualization)")
+        info_box.label(text="")
+        info_box.label(text="After splitting, use Post-Split Cleanup to:", icon='MODIFIER')
+        info_box.label(text="• Clean edges (smooth cut boundaries)")
+        info_box.label(text="• Fill cuts (cap open surfaces)")
+        
+        layout.separator()
         
         # ===== Pivot Points Info =====
         pivot_collection = None
@@ -741,9 +910,83 @@ class PET_PT_edge_cut_segmentation(Panel):
         
         info_box = layout.box()
         info_box.label(text="Fast Segmentation Workflow", icon='INFO')
-        info_box.label(text="1. Select edge loops around appendages")
-        info_box.label(text="2. Mark each cut with segment name")
-        info_box.label(text="3. Apply - remaining mesh becomes body")
+        info_box.label(text="1. Click 'Find Edge Loop for [Part]' to auto-detect boundary")
+        info_box.label(text="2. (Optional) Refine selection with Grow/Shrink/Smooth")
+        info_box.label(text="3. Mark each cut with segment name")
+        info_box.label(text="4. Apply - remaining mesh becomes body")
+        info_box.label(text="Auto-find uses grow logic for accurate boundaries", icon='INFO')
+        layout.separator()
+        
+        # Pet Type Selector
+        settings = context.scene.pet_segmentation_settings
+        layout.label(text="Pet Type:")
+        row = layout.row()
+        row.prop(settings, "pet_type", expand=True)
+        layout.separator()
+        
+        # Auto-Find Edge Loops Section
+        auto_find_box = layout.box()
+        auto_find_box.label(text="Auto-Find Edge Loops", icon='LOOP_FORWARDS')
+        auto_find_box.label(text="Select vertices for part, then click to find boundary loop")
+        
+        col = auto_find_box.column(align=True)
+        
+        row = col.row(align=True)
+        op = row.operator("pet.find_edge_loop_for_part", text="Find Edge Loop for Head")
+        op.part_type = 'head'
+        
+        row = col.row(align=True)
+        op = row.operator("pet.find_edge_loop_for_part", text="Find Edge Loop for Front L Leg")
+        op.part_type = 'leg_front_l'
+        op = row.operator("pet.find_edge_loop_for_part", text="Find Edge Loop for Front R Leg")
+        op.part_type = 'leg_front_r'
+        
+        row = col.row(align=True)
+        op = row.operator("pet.find_edge_loop_for_part", text="Find Edge Loop for Back L Leg")
+        op.part_type = 'leg_back_l'
+        op = row.operator("pet.find_edge_loop_for_part", text="Find Edge Loop for Back R Leg")
+        op.part_type = 'leg_back_r'
+        
+        row = col.row(align=True)
+        op = row.operator("pet.find_edge_loop_for_part", text="Find Edge Loop for Tail")
+        op.part_type = 'tail'
+        
+        row = col.row(align=True)
+        op = row.operator("pet.find_edge_loop_for_part", text="Find Edge Loop for Left Wing")
+        op.part_type = 'wing_l'
+        op = row.operator("pet.find_edge_loop_for_part", text="Find Edge Loop for Right Wing")
+        op.part_type = 'wing_r'
+        
+        layout.separator()
+        
+        # Refine Selection Section - for improving edge loop accuracy
+        refine_box = layout.box()
+        refine_box.label(text="Refine Edge Selection", icon='MODIFIER')
+        refine_box.label(text="Improve edge loop accuracy before marking")
+        
+        if context.mode != 'EDIT_MESH':
+            refine_box.label(text="Switch to Edit Mode to refine selection", icon='INFO')
+        else:
+            # Selection refinement tools
+            refine_col = refine_box.column(align=True)
+            
+            # Grow/Shrink row
+            grow_shrink_row = refine_col.row(align=True)
+            grow_op = grow_shrink_row.operator("pet.grow_selection", text="Grow +", icon='FULLSCREEN_ENTER')
+            grow_op.iterations = 1
+            shrink_op = grow_shrink_row.operator("pet.shrink_selection", text="Shrink -", icon='FULLSCREEN_EXIT')
+            shrink_op.iterations = 1
+            
+            # Smooth boundary
+            smooth_row = refine_col.row(align=True)
+            smooth_op = smooth_row.operator("pet.smooth_selection_boundary", text="Smooth Boundary", icon='BRUSH_DATA')
+            smooth_op.iterations = 2
+            
+            refine_box.separator()
+            refine_box.label(text="💡 Use after 'Find Edge Loop' to refine the boundary", icon='INFO')
+            refine_box.label(text="Grow/Shrink: Expand or contract edge selection", icon='INFO')
+            refine_box.label(text="Smooth: Clean up jagged boundary edges", icon='INFO')
+        
         layout.separator()
         
         marked_segments = obj.get("pet_marked_segments", [])
@@ -802,12 +1045,6 @@ class PET_PT_edge_cut_segmentation(Panel):
         apply_row = action_box.row()
         apply_row.scale_y = 1.5
         apply_op = apply_row.operator("pet.apply_segment_cuts", text="Apply Cuts & Create Groups", icon='CHECKMARK')
-        
-        if obj.vertex_groups:
-            action_box.separator()
-            split_op = action_box.operator("pet.split_by_vertex_groups", text="Split Into Parts", icon='MODIFIER_ON')
-            split_op.create_pivots = True
-            split_op.keep_original = True
 
 
 class PET_PT_r6_joints(Panel):
@@ -865,6 +1102,13 @@ class PET_PT_r6_joints(Panel):
             
             create_box.prop(create_op, "joint_scale")
             create_box.prop(create_op, "use_custom_offsets")
+            create_box.separator()
+            create_box.prop(create_op, "use_stored_pivots")
+            if create_op.use_stored_pivots:
+                create_box.label(text="✓ Uses pivot positions from split operation", icon='CHECKMARK')
+                create_box.label(text="Pivots are at actual boundaries (before gaps)", icon='INFO')
+            else:
+                create_box.label(text="⚠️ Will recalculate (may place in gap center)", icon='ERROR')
             
             layout.separator()
         else:
@@ -888,6 +1132,92 @@ class PET_PT_r6_joints(Panel):
         info_box.label(text="Motor6D joints for Roblox animation")
         info_box.label(text="Export as FBX + JSON metadata")
         info_box.label(text="Use Roblox import script with JSON")
+        
+        if body_found and segments_found:
+            info_box.separator()
+            info_box.label(text="⚠️ Critical: Pivot Positions", icon='ERROR')
+            create_op = layout.operator("pet.create_r6_joints", text="Create R6 Joints")
+            info_box.prop(create_op, "use_stored_pivots")
+            info_box.label(text="Stored pivots are at actual boundaries", icon='INFO')
+            info_box.label(text="(calculated BEFORE gaps were created)", icon='INFO')
+
+
+class PET_PT_post_split_cleanup(Panel):
+    """Post-split cleanup panel for edge smoothing and cut filling"""
+    bl_label = "Post-Split Cleanup"
+    bl_idname = "PET_PT_post_split_cleanup"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        
+        if not selected_meshes:
+            layout.label(text="Select split part objects", icon='INFO')
+            layout.label(text="(Objects created from splitting)")
+            return
+        
+        layout.label(text=f"{len(selected_meshes)} mesh object(s) selected", icon='MESH_DATA')
+        layout.separator()
+        
+        # Edge Cleaning Section
+        edge_box = layout.box()
+        edge_box.label(text="Edge Cleaning", icon='MODIFIER')
+        edge_box.label(text="Smooth cut boundary edges for cleaner surfaces")
+        
+        if context.mode != 'OBJECT':
+            edge_box.label(text="Switch to Object Mode", icon='INFO')
+        else:
+            smooth_op = edge_box.operator("pet.smooth_cut_edges", text="Smooth Cut Edges", icon='BRUSH_DATA')
+            edge_box.prop(smooth_op, "iterations")
+            edge_box.prop(smooth_op, "smooth_factor", slider=True)
+            edge_box.prop(smooth_op, "only_boundary")
+            
+            edge_box.separator()
+            edge_box.operator("pet.select_cut_boundaries", text="Select Cut Boundaries", icon='RESTRICT_SELECT_OFF')
+            edge_box.label(text="Manually select edges, then smooth", icon='INFO')
+        
+        layout.separator()
+        
+        # Cut Filling Section
+        fill_box = layout.box()
+        fill_box.label(text="Cut Face Filling", icon='MESH_ICOSPHERE')
+        fill_box.label(text="Fill open cut boundaries with material-matched faces")
+        
+        if context.mode != 'OBJECT':
+            fill_box.label(text="Switch to Object Mode", icon='INFO')
+        else:
+            fill_op = fill_box.operator("pet.fill_cut_faces", text="Fill Cut Faces", icon='FULLSCREEN_ENTER')
+            fill_box.prop(fill_op, "use_material_color")
+            if not fill_op.use_material_color:
+                fill_box.prop(fill_op, "fallback_color")
+            
+            fill_box.separator()
+            fill_box.label(text="Material Detection:", icon='INFO')
+            fill_box.label(text="1. Principled BSDF base color")
+            fill_box.label(text="2. Material diffuse color")
+            fill_box.label(text="3. Vertex colors (average)")
+            fill_box.label(text="4. Fallback color")
+        
+        layout.separator()
+        
+        # Workflow Guidance
+        workflow_box = layout.box()
+        workflow_box.label(text="Workflow Order", icon='SORTALPHA')
+        workflow_box.label(text="1. Split model (creates gaps)")
+        workflow_box.label(text="2. Clean edges (smooth cut boundaries)")
+        workflow_box.label(text="3. Fill cuts (cap open surfaces)")
+        workflow_box.label(text="4. Create R6 joints (uses stored pivots)")
+        workflow_box.label(text="5. Export to Roblox")
+        
+        workflow_box.separator()
+        workflow_box.label(text="⚠️ Gaps are workflow-only", icon='ERROR')
+        workflow_box.label(text="Pivot points are at actual boundaries")
 
 
 class PET_PT_batch_operations(Panel):
@@ -957,8 +1287,8 @@ class PET_PT_batch_operations(Panel):
 
 
 class PET_PT_manual_part_selection(Panel):
-    """Manual Part Selection panel - click-to-select with intelligent auto-selection"""
-    bl_label = "Manual Part Selection"
+    """Manual Part Segmentation panel - click-to-select with intelligent auto-selection"""
+    bl_label = "Manual Part Segmentation"
     bl_idname = "PET_PT_manual_part_selection"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -979,9 +1309,9 @@ class PET_PT_manual_part_selection(Panel):
         
         # ===== Mode Status =====
         if state.is_active:
-            # Manual Part Selection is ACTIVE
+            # Manual Part Segmentation is ACTIVE
             status_box = layout.box()
-            status_box.label(text="Manual Part Selection ACTIVE", icon='PLAY')
+            status_box.label(text="Manual Part Segmentation ACTIVE", icon='PLAY')
             
             # Get part list and completed parts
             part_list = obj.get("pet_manual_part_list", [])
@@ -1035,13 +1365,24 @@ class PET_PT_manual_part_selection(Panel):
                 current_box = layout.box()
                 current_box.label(text=f"Currently Assigning: {get_part_display_name(state.current_part)}", icon='RESTRICT_SELECT_OFF')
                 
-                # Click to Select button
+                # Primary: auto-grow from current selection using intelligent logic
                 click_row = current_box.row()
                 click_row.scale_y = 1.5
-                click_op = click_row.operator("pet.click_to_assign_part", 
-                                              text=f"Click to Select {get_part_display_name(state.current_part)}", 
-                                              icon='EYEDROPPER')
-                click_op.part_type = state.current_part
+                auto_op = click_row.operator(
+                    "pet.auto_grow_current_selection",
+                    text=f"Click to Select {get_part_display_name(state.current_part)}",
+                    icon='EYEDROPPER',
+                )
+                auto_op.part_type = state.current_part
+                
+                # Secondary: use current selection as-is for this part
+                as_is_row = current_box.row()
+                as_is_row.scale_y = 1.1
+                as_is_row.operator(
+                    "pet.save_part_selection",
+                    text=f"Use Current Selection as {get_part_display_name(state.current_part)}",
+                    icon='CHECKMARK',
+                )
                 
                 # Selection info
                 if state.current_selection_vertex_count > 0:
@@ -1058,6 +1399,7 @@ class PET_PT_manual_part_selection(Panel):
                 
                 edit_row2 = current_box.row(align=True)
                 edit_row2.operator("pet.smooth_selection_boundary", text="Smooth Boundary")
+                edit_row2.operator("pet.fill_gaps_selection", text="Fill Gaps")
                 
                 current_box.separator()
                 
@@ -1104,9 +1446,9 @@ class PET_PT_manual_part_selection(Panel):
             custom_box.operator("pet.add_custom_part", text="Add Custom Part", icon='ADD')
             
         else:
-            # Manual Part Selection is NOT active
+            # Manual Part Segmentation is NOT active
             intro_box = layout.box()
-            intro_box.label(text="Manual Part Selection", icon='BRUSH_DATA')
+            intro_box.label(text="Manual Part Segmentation", icon='BRUSH_DATA')
             intro_box.label(text="Click-to-select with intelligent auto-selection")
             intro_box.label(text="")
             intro_box.label(text="Workflow:")
@@ -1129,7 +1471,7 @@ class PET_PT_manual_part_selection(Panel):
             # Start button
             start_row = layout.row()
             start_row.scale_y = 1.5
-            start_row.operator("pet.start_manual_part_selection", text="Start Manual Part Selection", icon='PLAY')
+            start_row.operator("pet.start_manual_part_selection", text="Start Manual Part Segmentation", icon='PLAY')
             
             layout.separator()
             
@@ -1144,118 +1486,6 @@ class PET_PT_manual_part_selection(Panel):
                 info_box.label(text="if 'Clear Existing Groups' is enabled")
 
 
-class PET_PT_manual_segment(Panel):
-    """Simple manual segmentation panel - optimized for high-poly models"""
-    bl_label = "Manual Segment"
-    bl_idname = "PET_PT_manual_segment"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Pet Optimizer"
-    bl_parent_id = "PET_PT_main_panel"
-    bl_options = {'DEFAULT_CLOSED'}
-    
-    def draw(self, context):
-        layout = self.layout
-        obj = context.active_object
-        
-        if not obj or obj.type != 'MESH':
-            layout.label(text="Select a mesh object", icon='INFO')
-            return
-        
-        face_count = len(obj.data.polygons)
-        layout.label(text=f"Faces: {face_count:,}", icon='MESH_DATA')
-        
-        if face_count > 100000:
-            warn_box = layout.box()
-            warn_box.label(text="High-Poly Model Detected", icon='INFO')
-            warn_box.label(text="Segment on full mesh to preserve quality")
-            warn_box.label(text="Decimate after splitting if needed")
-            layout.separator()
-        
-        select_box = layout.box()
-        select_box.label(text="1. Select Vertices", icon='VERTEXSEL')
-        
-        if obj.mode != 'EDIT':
-            select_box.label(text="Switch to Edit mode to select", icon='INFO')
-            select_box.operator("object.mode_set", text="Enter Edit Mode").mode = 'EDIT'
-        else:
-            select_box.label(text="Use Blender's selection tools:")
-            select_box.label(text="  - Box Select (B)")
-            select_box.label(text="  - Circle Select (C)")
-            select_box.label(text="  - Lasso Select (Ctrl+click)")
-            
-            select_box.separator()
-            select_box.label(text="Refine Selection:", icon='MODIFIER')
-            
-            row = select_box.row(align=True)
-            row.operator("pet.grow_selection", text="Grow +")
-            row.operator("pet.shrink_selection", text="Shrink -")
-            
-            row = select_box.row(align=True)
-            row.operator("pet.smooth_selection_boundary", text="Smooth Boundary")
-            row.operator("pet.select_linked_flat", text="Select Linked Flat")
-        
-        layout.separator()
-        
-        assign_box = layout.box()
-        assign_box.label(text="2. Assign to Segment", icon='GROUP_VERTEX')
-        
-        segment_names = ['Head', 'Leg_Front_L', 'Leg_Front_R', 'Leg_Back_L', 'Leg_Back_R', 'Tail', 'Wing_L', 'Wing_R']
-        
-        col = assign_box.column(align=True)
-        for i in range(0, len(segment_names), 2):
-            row = col.row(align=True)
-            for j in range(2):
-                if i + j < len(segment_names):
-                    name = segment_names[i + j]
-                    op = row.operator("pet.assign_selection_to_segment", text=name)
-                    op.segment_name = name
-        
-        assign_box.separator()
-        assign_box.operator("pet.invert_assign_body", text="Assign Remaining as Body", icon='MESH_CUBE')
-        
-        layout.separator()
-        
-        segment_groups = [vg for vg in obj.vertex_groups if vg.name.startswith("Segment_")]
-        if segment_groups:
-            preview_box = layout.box()
-            preview_box.label(text="3. Current Segments", icon='HIDE_OFF')
-            
-            preview_box.operator("pet.preview_segments", text="Preview Colors", icon='COLOR')
-            
-            for vg in segment_groups:
-                segment_name = vg.name[8:]
-                row = preview_box.row(align=True)
-                
-                vert_count = 0
-                vg_index = vg.index
-                for v in obj.data.vertices:
-                    for g in v.groups:
-                        if g.group == vg_index and g.weight > 0.5:
-                            vert_count += 1
-                            break
-                
-                row.label(text=f"{segment_name}: {vert_count:,}")
-                
-                select_op = row.operator("pet.select_segment", text="", icon='RESTRICT_SELECT_OFF')
-                select_op.segment_name = segment_name
-                
-                clear_op = row.operator("pet.clear_segment", text="", icon='X')
-                clear_op.segment_name = segment_name
-            
-            layout.separator()
-            
-            split_box = layout.box()
-            split_box.label(text="4. Split Model", icon='MOD_EXPLODE')
-            split_box.operator("pet.split_by_segments", text="Split Into Parts", icon='UNLINKED')
-            
-            split_box.separator()
-            split_box.label(text="5. Optimize (Optional)", icon='MOD_DECIM')
-            split_box.label(text="After splitting, decimate individual parts if needed")
-            split_box.operator("pet.quick_decimate", text="Decimate Selected Part", icon='MOD_DECIM')
-            
-            split_box.separator()
-            split_box.label(text="6. Create R6 Joints", icon='BONE_DATA')
 
 
 class PET_PT_symmetry(Panel):
@@ -1336,17 +1566,19 @@ classes = [
     PET_ManualAssignmentState,
     PET_SymmetrySettings,
     PET_ManualPartSelectionState,
+    PET_LowPolySettings,
     PET_PT_main_panel,
     PET_PT_mesh_optimization,
     PET_PT_segmentation,
     PET_PT_symmetry,
     PET_PT_manual_part_selection,
-    PET_PT_manual_segment,
     PET_PT_edge_cut_segmentation,
+    PET_PT_split,
     PET_PT_rigging,
     PET_PT_r6_joints,
     PET_PT_standardization,
     PET_PT_export,
+    PET_PT_post_split_cleanup,
     PET_PT_batch_operations,
 ]
 
@@ -1358,6 +1590,7 @@ def register():
     bpy.types.Scene.pet_manual_assignment_state = bpy.props.PointerProperty(type=PET_ManualAssignmentState)
     bpy.types.Scene.pet_symmetry_settings = bpy.props.PointerProperty(type=PET_SymmetrySettings)
     bpy.types.Scene.pet_manual_part_selection_state = bpy.props.PointerProperty(type=PET_ManualPartSelectionState)
+    bpy.types.Scene.pet_lowpoly_settings = bpy.props.PointerProperty(type=PET_LowPolySettings)
 
 def unregister():
     if hasattr(bpy.types.Scene, 'pet_segmentation_settings'):
@@ -1368,6 +1601,8 @@ def unregister():
         del bpy.types.Scene.pet_symmetry_settings
     if hasattr(bpy.types.Scene, 'pet_manual_part_selection_state'):
         del bpy.types.Scene.pet_manual_part_selection_state
+    if hasattr(bpy.types.Scene, 'pet_lowpoly_settings'):
+        del bpy.types.Scene.pet_lowpoly_settings
     
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

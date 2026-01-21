@@ -35,6 +35,39 @@ The Pet Model Optimizer is a comprehensive Blender addon designed specifically f
 
 **Purpose**: Reduce polygon counts while preserving organic shapes and important surface details.
 
+#### Low-Poly Prep (Pre-Segmentation)
+
+**Purpose**: Gently reduce very dense meshes in **small, controllable steps before any cutting or splitting**, so segmentation and bisect operations stay stable and the mesh/fabric surface remains smooth.
+
+**Location**: `Pet Optimizer` N-panel → **Mesh Optimization** → **Low-Poly Prep (Before Segmentation)**.
+
+**Workflow**:
+
+1. Select your high-poly mesh.
+2. Open the **Mesh Optimization** panel.
+3. In the **Low-Poly Prep** box:
+   - Set **Step Reduction** (recommended: `0.05–0.15`).
+   - Choose **Algorithm** (`Auto`, `QEM Edge Collapse`, or `Centroid Clustering`).
+   - Enable **Preserve Sharp Features** to protect creases, seams, and outer borders.
+   - Optionally set **Target Max Faces** to stop decimation once you reach a comfortable face count.
+4. Click **Preview Low-Poly** to create a `_lowpoly` duplicate for side-by-side comparison.
+5. When satisfied, use **Apply Step** to apply the same gentle reduction directly to the active mesh.
+6. Repeat small steps until the model is light enough for segmentation and cutting.
+
+**Stats & Feedback**:
+
+- The addon tracks:
+  - `pet_lowpoly_initial_faces`: Face count before the first low-poly prep step.
+  - `pet_lowpoly_last_faces`: Most recent face count after prep.
+  - `pet_lowpoly_total_reduction`: Cumulative reduction ratio (0–1).
+- These values are displayed in the **Low-Poly Prep** box so you can see total reduction across multiple passes.
+
+**Best Practices**:
+
+- Always run Low-Poly Prep **before** segmentation, manual cutting, or edge-cut workflows on extremely dense meshes.
+- Use small steps (5–15%) and visually inspect the silhouette and fabric folds after each pass.
+- Keep **Preserve Sharp Features** enabled for clothing seams, hard edges, and important silhouettes.
+
 #### Algorithms
 
 ##### 1. QEM Edge Collapse (Quadric Error Metric)
@@ -42,10 +75,16 @@ The Pet Model Optimizer is a comprehensive Blender addon designed specifically f
 **Best For**: High-detail models where surface quality is critical
 
 **How It Works**:
-- Calculates a quadric error metric for each edge
-- Collapses edges with lowest error impact first
-- Preserves surface curvature and boundaries
-- Maintains edge flow and topology
+- Calculates a simplified quadric-style priority for each edge using:
+  - Edge length
+  - Local face area
+  - Dihedral angle between adjacent faces (curvature)
+- Collapses short edges in **flat, low-detail regions first**.
+- When **Preserve Sharp Features** is enabled:
+  - Skips UV seam edges.
+  - Skips outer boundary edges (silhouette protection).
+  - Strongly de-prioritizes edges across sharp creases (higher dihedral angles).
+- Maintains edge flow and topology while favoring smooth fabric-like regions for reduction.
 
 **Settings**:
 - **Reduction**: Target face reduction (0-90%)
@@ -67,6 +106,7 @@ The Pet Model Optimizer is a comprehensive Blender addon designed specifically f
 - Clusters vertices within each grid cell
 - Moves vertices to cell centroids
 - Removes degenerate geometry
+- In Low-Poly Prep, the grid size is derived from the object bounds so that even very small steps remain **gentle** and avoid over-aggregation.
 
 **Settings**:
 - **Reduction**: Target face reduction (0-90%)

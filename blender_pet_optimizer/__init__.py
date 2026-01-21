@@ -31,6 +31,8 @@ modules_to_register = [
     operators.manual_segment,
     operators.symmetry,
     operators.manual_part_selection,
+    getattr(operators, 'edge_cleanup', None),
+    getattr(operators, 'cut_filling', None),
     ui.panels,
     ui.preferences,
 ]

@@ -15,6 +15,8 @@ from . import batch_export
 from . import manual_segment
 from . import symmetry
 from . import manual_part_selection
+from . import edge_cleanup
+from . import cut_filling
 
 __all__ = [
     "mesh_optimizer",
@@ -29,4 +31,6 @@ __all__ = [
     "manual_segment",
     "symmetry",
     "manual_part_selection",
+    "edge_cleanup",
+    "cut_filling",
 ]

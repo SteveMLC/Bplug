@@ -6,8 +6,13 @@ Splits meshes by vertex groups with full data preservation (UVs, colors, materia
 import bpy
 import bmesh
 from bpy.types import Operator
-from bpy.props import BoolProperty
+from bpy.props import BoolProperty, FloatProperty
 from mathutils import Vector
+import time
+
+from ..utils.spatial_selection import (
+    fill_small_surrounded_gaps,
+)
 
 
 def find_boundary_edges(bm, vertex_group_indices):
@@ -408,6 +413,16 @@ class PET_OT_split_by_vertex_groups(Operator):
         default=True
     )
     
+    gap_distance: FloatProperty(
+        name="Gap Distance",
+        description="Distance to separate parts after splitting (for filling/smoothing workflow). Set to 0 to skip gap creation.",
+        default=0.1,
+        min=0.0,
+        max=10.0,
+        step=0.01,
+        precision=3
+    )
+    
     def execute(self, context):
         obj = context.active_object
         
@@ -429,9 +444,21 @@ class PET_OT_split_by_vertex_groups(Operator):
         verification_warnings = []
         
         # Calculate attachment points BEFORE splitting (using original mesh)
+        # CRITICAL: These positions are at actual separation boundaries (where appendage meets body)
+        # Must be stored BEFORE creating gaps so R6 joints can use them
         attachment_points = {}
         if self.create_pivots:
             attachment_points = calculate_attachment_points_from_vertex_groups(obj)
+            # Store attachment points in original object metadata for R6 joints operator
+            # Format: {(group1_name, group2_name): Vector(position), ...}
+            if attachment_points:
+                # Convert Vector to list for storage (Vector not directly serializable)
+                stored_points = {}
+                for key, pos in attachment_points.items():
+                    stored_points[str(key)] = list(pos)
+                obj["pet_stored_attachment_points"] = stored_points
+                # Also store mapping info for lookup by object names later
+                obj["pet_attachment_points_created"] = True
         
         try:
             # Check for potential overlapping vertex groups (vertices in multiple groups)
@@ -512,35 +539,83 @@ class PET_OT_split_by_vertex_groups(Operator):
                 bm = bmesh.from_edit_mesh(current_mesh)
                 bm.faces.ensure_lookup_table()
                 bm.verts.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
                 
+                # EXPAND: Include internal vertices that are surrounded by the vertex group
+                # This ensures vertices inside horns, nose, etc. are included
+                vertex_mask = self._expand_vertex_group_internal_vertices(
+                    original_obj, vg.name, bm, vertex_mask, current_mesh
+                )
+                
+                # SPATIAL INCLUSION: Include all vertices within spatial boundary of vertex group
+                # This captures isolated vertices that are inside the segment boundary
+                # Respects boundaries of other segments (excludes vertices in other groups)
+                vertex_mask = self._include_vertices_within_spatial_boundary(
+                    original_obj, vg.name, bm, vertex_mask, current_mesh, expansion_factor=0.015
+                )
+                
+                # CRITICAL: Identify separation boundary edges BEFORE splitting
+                # These are edges that connect vertices from different vertex groups
+                # They will become the cut boundaries after separation
+                separation_boundary_edges = self._identify_separation_boundary_edges(
+                    bm, vertex_mask, vg.name
+                )
+                
+                # Build exclusion set for other vertex groups to prevent bleeding
+                other_group_vertices = set()
+                vg_index = original_obj.vertex_groups.find(vg.name)
+                if vg_index != -1:
+                    for other_vg in original_obj.vertex_groups:
+                        if other_vg.name == vg.name:
+                            continue
+                        other_vg_index = other_vg.index
+                        for vertex in current_mesh.vertices:
+                            for group in vertex.groups:
+                                if group.group == other_vg_index and group.weight > 0.5:
+                                    other_group_vertices.add(vertex.index)
+                                    break
+                
+                # Select faces: include if ANY vertex is in spatially-included set
+                # BUT exclude faces where majority of vertices belong to OTHER groups
+                # This ensures isolated vertices are captured while respecting segment boundaries
                 faces_selected = 0
                 for face in bm.faces:
-                    # Count vertices in this face that belong to the vertex group
-                    verts_in_group = sum(1 for v in face.verts if vertex_mask[v.index])
-                    # Face belongs to group if majority of its vertices are in the group
-                    if verts_in_group >= len(face.verts) / 2:  # Majority threshold
+                    # Check if any vertex in face is in the vertex group (including spatially-included)
+                    has_vertex_in_group = any(vertex_mask[v.index] for v in face.verts)
+                    
+                    # Check if majority of vertices belong to OTHER groups (exclusion check)
+                    verts_in_other_groups = sum(1 for v in face.verts if v.index in other_group_vertices)
+                    majority_in_other_groups = verts_in_other_groups >= len(face.verts) / 2
+                    
+                    # Include face if it has vertices in our group AND doesn't belong to other groups
+                    if has_vertex_in_group and not majority_in_other_groups:
                         face.select = True
                         faces_selected += 1
+                
+                # ENHANCE: Include connected faces that don't cross boundaries
+                # This ensures internal faces (like inside horns) are included
+                faces_selected = self._expand_face_selection_within_boundaries(
+                    bm, vertex_mask, separation_boundary_edges
+                )
                 
                 # Update edit mesh with selection
                 bmesh.update_edit_mesh(current_mesh)
                 bm.free()
                 
-                # Select linked faces to get connected geometry
-                bpy.ops.mesh.select_linked(delimit={'SEAM'})
-                
-                # Go back to object mode to check selection
-                bpy.ops.object.mode_set(mode='OBJECT')
-                
                 # Validate that faces are actually selected before attempting to separate
-                selected_faces = sum(1 for p in current_mesh.polygons if p.select)
-                if selected_faces == 0:
+                if faces_selected == 0:
                     # No faces selected - selection might have failed
                     self.report({'WARNING'}, f"No faces selected for vertex group '{vg.name}' - skipping")
+                    bpy.ops.object.mode_set(mode='OBJECT')
                     continue  # Skip if no faces selected
                 
-                # Go back to edit mode and separate
-                bpy.ops.object.mode_set(mode='EDIT')
+                # Ensure we're still in edit mode (we should be, but be safe)
+                if context.mode != 'EDIT':
+                    bpy.ops.object.mode_set(mode='EDIT')
+                
+                # Separate the selected faces into a new object
+                # NOTE: Removed select_linked() call as it was interfering with selection
+                # The bmesh selection is already complete based on vertex group membership
                 bpy.ops.mesh.separate(type='SELECTED')
                 bpy.ops.object.mode_set(mode='OBJECT')
                 
@@ -552,6 +627,15 @@ class PET_OT_split_by_vertex_groups(Operator):
                 if new_objs:
                     new_obj = new_objs[0]
                     new_obj.name = f"{original_obj.name}_{vg.name}"
+                    
+                    # CRITICAL: Store separation boundary edge info for cut detection
+                    # Convert Vector objects to lists for storage (Vectors aren't directly serializable)
+                    if separation_boundary_edges:
+                        stored_boundaries = []
+                        for v1_co, v2_co in separation_boundary_edges:
+                            stored_boundaries.append([list(v1_co), list(v2_co)])
+                        new_obj["pet_separation_boundary_edges"] = stored_boundaries
+                        new_obj["pet_source_vertex_group"] = vg.name
                     
                     # Verify data preservation if requested
                     if self.verify_data:
@@ -568,7 +652,20 @@ class PET_OT_split_by_vertex_groups(Operator):
                     # If no new object was created, the selection might have failed
                     self.report({'WARNING'}, f"Failed to split vertex group: {vg.name} - no new object created")
             
+            # Create gaps between parts (if gap_distance > 0)
+            # This moves parts apart for filling/smoothing workflow
+            # IMPORTANT: Pivot positions were already calculated BEFORE splitting
+            # Gaps don't affect stored pivot positions - they're at original boundaries
+            body_obj = None
+            if self.gap_distance > 0.0 and created_objects:
+                body_obj = self._find_body_object(created_objects, obj)
+                if body_obj:
+                    self._apply_gap_separation(created_objects, body_obj, self.gap_distance)
+                else:
+                    self.report({'WARNING'}, "Could not find body object - skipping gap creation")
+            
             # Create pivot points using pre-calculated positions (BEFORE deleting original)
+            # Pivot positions are at original attachment boundaries (before gaps)
             if self.create_pivots and attachment_points and created_objects:
                 pivots = self.create_pivot_points_from_attachments(obj, created_objects, attachment_points)
                 all_pivots.extend(pivots)
@@ -585,8 +682,10 @@ class PET_OT_split_by_vertex_groups(Operator):
             
             # Report results
             result_msg = f"Split into {len(created_objects)} objects"
+            if self.gap_distance > 0.0:
+                result_msg += f" with {self.gap_distance:.3f} gap separation"
             if all_pivots:
-                result_msg += f" with {len(all_pivots)} pivot points"
+                result_msg += f" and {len(all_pivots)} pivot points"
             if verification_warnings:
                 result_msg += f" ({len(verification_warnings)} warnings)"
                 for warning in verification_warnings[:3]:  # Show first 3 warnings
@@ -604,6 +703,340 @@ class PET_OT_split_by_vertex_groups(Operator):
             # Log full traceback for debugging
             print(f"Split error traceback:\n{traceback.format_exc()}")
             return {'CANCELLED'}
+    
+    def _find_body_object(self, split_objects, original_obj):
+        """Find the body object in split objects"""
+        # Look for object with 'body' in name (case insensitive)
+        for obj in split_objects:
+            name_lower = obj.name.lower()
+            if 'body' in name_lower or 'torso' in name_lower:
+                return obj
+        
+        # Fallback: find largest object (body is usually largest)
+        if split_objects:
+            return max(split_objects, key=lambda o: len(o.data.vertices) if o.data.vertices else 0)
+        
+        return None
+    
+    def _expand_vertex_group_internal_vertices(self, obj, vertex_group_name, bm, vertex_mask, mesh):
+        """
+        Expand vertex group to include all internal vertices surrounded by the group.
+        Uses connectivity analysis to find vertices inside the selection (e.g., inside horns, nose).
+        
+        Args:
+            obj: Blender object with mesh data
+            vertex_group_name: Name of vertex group being expanded
+            bm: bmesh object (in edit mesh state)
+            vertex_mask: List[bool] - Current vertex mask (True for vertices in group)
+            mesh: Blender mesh data
+        
+        Returns:
+            List[bool]: Updated vertex_mask with internal vertices included
+        """
+        # Convert vertex_mask to set of indices for gap-filling function
+        selected_indices = {i for i, in_group in enumerate(vertex_mask) if in_group}
+        
+        if not selected_indices:
+            return vertex_mask
+        
+        # Build exclusion set: vertices that belong to other vertex groups
+        excluded_indices = set()
+        for other_vg in obj.vertex_groups:
+            if other_vg.name == vertex_group_name:
+                continue
+            
+            other_vg_index = other_vg.index
+            for vertex in mesh.vertices:
+                for group in vertex.groups:
+                    if group.group == other_vg_index and group.weight > 0.5:
+                        # Don't exclude vertices that are already in our group
+                        if not vertex_mask[vertex.index]:
+                            excluded_indices.add(vertex.index)
+                        break
+        
+        # Use gap-filling to find internal vertices
+        # More aggressive parameters to catch larger internal structures like horns
+        start_time = time.time()
+        expanded_indices = fill_small_surrounded_gaps(
+            bm,
+            selected_indices,
+            max_gap_size=1024,  # Larger gap size for structures like horns
+            neighbor_selected_ratio=0.7,  # More lenient to catch mostly-surrounded vertices
+            max_total_vertices=None,  # No cap - include all internal vertices
+            start_time=start_time,
+            timeout_seconds=10.0,
+            excluded_indices=excluded_indices,
+            use_component_level_check=True,  # Use relaxed checking for better coverage
+        )
+        
+        # Update vertex_mask with expanded indices
+        expanded_mask = list(vertex_mask)
+        for idx in expanded_indices:
+            if idx < len(expanded_mask):
+                expanded_mask[idx] = True
+        
+        added_count = len(expanded_indices) - len(selected_indices)
+        if added_count > 0:
+            print(f"[Mesh Splitter] Expanded '{vertex_group_name}' vertex group: added {added_count} internal vertices")
+        
+        return expanded_mask
+    
+    def _include_vertices_within_spatial_boundary(self, obj, vertex_group_name, bm, vertex_mask, mesh, expansion_factor=0.015):
+        """
+        Include all vertices within the spatial boundary (bounding box) of the vertex group.
+        Expands boundary by a small percentage (1-2%) to catch outliers, but excludes vertices
+        assigned to other vertex groups to respect segment boundaries.
+        
+        Args:
+            obj: Blender object with mesh data
+            vertex_group_name: Name of vertex group being processed
+            bm: bmesh object (in edit mesh state)
+            vertex_mask: List[bool] - Current vertex mask (True for vertices in group)
+            mesh: Blender mesh data
+            expansion_factor: Factor for boundary expansion (default 0.015 = 1.5%)
+        
+        Returns:
+            List[bool]: Updated vertex_mask with spatially-contained vertices included
+        """
+        # Get vertices currently in the vertex group
+        vertices_in_group = [i for i, in_group in enumerate(vertex_mask) if in_group]
+        
+        if not vertices_in_group:
+            return vertex_mask
+        
+        # Calculate bounding box of vertices in the group (in object space)
+        bbox_min = None
+        bbox_max = None
+        
+        for vert_idx in vertices_in_group:
+            if vert_idx >= len(bm.verts):
+                continue
+            vert_co = bm.verts[vert_idx].co
+            
+            if bbox_min is None:
+                bbox_min = Vector(vert_co)
+                bbox_max = Vector(vert_co)
+            else:
+                bbox_min.x = min(bbox_min.x, vert_co.x)
+                bbox_min.y = min(bbox_min.y, vert_co.y)
+                bbox_min.z = min(bbox_min.z, vert_co.z)
+                bbox_max.x = max(bbox_max.x, vert_co.x)
+                bbox_max.y = max(bbox_max.y, vert_co.y)
+                bbox_max.z = max(bbox_max.z, vert_co.z)
+        
+        if bbox_min is None or bbox_max is None:
+            return vertex_mask
+        
+        # Expand bounding box by expansion_factor (1-2% to catch outliers)
+        bbox_size = bbox_max - bbox_min
+        expand_amount = bbox_size * expansion_factor
+        
+        # Expanded bounding box
+        expanded_min = bbox_min - expand_amount
+        expanded_max = bbox_max + expand_amount
+        
+        # Build exclusion set: vertices assigned to OTHER vertex groups (weight > 0.5)
+        # This respects boundaries of other segments - they are off-limits
+        excluded_indices = set()
+        for other_vg in obj.vertex_groups:
+            if other_vg.name == vertex_group_name:
+                continue
+            
+            other_vg_index = other_vg.index
+            for vertex in mesh.vertices:
+                for group in vertex.groups:
+                    if group.group == other_vg_index and group.weight > 0.5:
+                        excluded_indices.add(vertex.index)
+                        break
+        
+        # Test all mesh vertices against expanded spatial boundary
+        # Include if: inside expanded boundary AND not excluded (not in other groups)
+        spatially_included = 0
+        updated_mask = list(vertex_mask)
+        
+        for vert_idx, vert in enumerate(bm.verts):
+            # Skip if already in mask
+            if updated_mask[vert_idx]:
+                continue
+            
+            # Skip if excluded (belongs to another vertex group)
+            if vert_idx in excluded_indices:
+                continue
+            
+            # Check if vertex is inside expanded bounding box
+            vert_co = vert.co
+            inside_boundary = (
+                expanded_min.x <= vert_co.x <= expanded_max.x and
+                expanded_min.y <= vert_co.y <= expanded_max.y and
+                expanded_min.z <= vert_co.z <= expanded_max.z
+            )
+            
+            if inside_boundary:
+                updated_mask[vert_idx] = True
+                spatially_included += 1
+        
+        if spatially_included > 0:
+            print(f"[Mesh Splitter] Included {spatially_included} vertices within spatial boundary for '{vertex_group_name}'")
+        
+        return updated_mask
+    
+    def _expand_face_selection_within_boundaries(self, bm, vertex_mask, boundary_edges):
+        """
+        Expand face selection to include connected faces that don't cross boundaries.
+        Ensures all faces connecting internal vertices are included.
+        
+        Args:
+            bm: bmesh object (in edit mesh state)
+            vertex_mask: List[bool] - True for vertices in the vertex group
+            boundary_edges: List of boundary edge coordinates (for reference)
+        
+        Returns:
+            int: Count of selected faces
+        """
+        # Start with faces that are already selected (majority vertices in group)
+        initial_selected_faces = {f.index for f in bm.faces if f.select}
+        
+        # Expand to connected faces that don't cross boundaries
+        # A face can be added if:
+        # 1. All its vertices are in the vertex group (including internal vertices we just added)
+        # 2. OR majority of vertices are in the group and it doesn't connect to other vertex groups
+        faces_to_check = list(initial_selected_faces)
+        selected_faces = set(initial_selected_faces)
+        checked = set()
+        
+        while faces_to_check:
+            face_idx = faces_to_check.pop(0)
+            if face_idx in checked:
+                continue
+            checked.add(face_idx)
+            
+            if face_idx >= len(bm.faces):
+                continue
+            
+            face = bm.faces[face_idx]
+            
+            # Check neighboring faces
+            for edge in face.edges:
+                for linked_face in edge.link_faces:
+                    linked_idx = linked_face.index
+                    if linked_idx in checked or linked_idx in selected_faces:
+                        continue
+                    
+                    # Count vertices in this face that are in the vertex group
+                    verts_in_group = sum(1 for v in linked_face.verts if vertex_mask[v.index])
+                    total_verts = len(linked_face.verts)
+                    
+                    # Include face if majority of vertices are in group
+                    if verts_in_group >= total_verts / 2:
+                        # Additional check: don't include if face has a boundary edge
+                        # connecting to another vertex group (unless all vertices are in group)
+                        has_boundary_edge = False
+                        if verts_in_group < total_verts:  # Not all vertices in group
+                            for face_edge in linked_face.edges:
+                                ev1, ev2 = face_edge.verts
+                                # Check if this edge connects vertices from different groups
+                                if vertex_mask[ev1.index] != vertex_mask[ev2.index]:
+                                    has_boundary_edge = True
+                                    break
+                        
+                        # Only add if all vertices are in group, or it doesn't cross a boundary
+                        if not has_boundary_edge:
+                            selected_faces.add(linked_idx)
+                            faces_to_check.append(linked_idx)
+        
+        # Update face selection
+        for face in bm.faces:
+            face.select = face.index in selected_faces
+        
+        return len(selected_faces)
+    
+    def _identify_separation_boundary_edges(self, bm, vertex_mask, vertex_group_name):
+        """
+        Identify edges that form the boundary between the vertex group being split and other groups.
+        These edges will become cut boundaries after separation.
+        
+        Args:
+            bm: bmesh object (in edit mesh state)
+            vertex_mask: List[bool] - True for vertices in the vertex group being split
+            vertex_group_name: Name of vertex group being split (for metadata)
+        
+        Returns:
+            List[tuple(Vector, Vector)]: List of edge vertex coordinates [(v1_co, v2_co), ...]
+        """
+        boundary_edges = []
+        
+        bm.edges.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        
+        for edge in bm.edges:
+            v1, v2 = edge.verts
+            
+            # Check if edge connects vertices from different groups
+            # One vertex is in the group being split, other is not
+            v1_in_group = vertex_mask[v1.index]
+            v2_in_group = vertex_mask[v2.index]
+            
+            # Edge is on boundary if vertices are on different sides
+            if v1_in_group != v2_in_group:
+                # Store vertex coordinates (in object space)
+                boundary_edges.append((Vector(v1.co), Vector(v2.co)))
+        
+        return boundary_edges
+    
+    def _calculate_separation_vector(self, body_obj, part_obj):
+        """Calculate direction vector to move part away from body"""
+        # Get world space centers
+        body_center = Vector((0, 0, 0))
+        part_center = Vector((0, 0, 0))
+        
+        # Use bounding box center for body
+        if body_obj and body_obj.data.vertices:
+            body_bbox = [body_obj.matrix_world @ Vector(corner) for corner in body_obj.bound_box]
+            body_center = sum(body_bbox, Vector((0, 0, 0))) / len(body_bbox)
+        
+        # Use bounding box center for part
+        if part_obj and part_obj.data.vertices:
+            part_bbox = [part_obj.matrix_world @ Vector(corner) for corner in part_obj.bound_box]
+            part_center = sum(part_bbox, Vector((0, 0, 0))) / len(part_bbox)
+        
+        # Direction from body center to part center
+        direction = part_center - body_center
+        
+        if direction.length > 0.001:
+            direction.normalize()
+            return direction
+        else:
+            # Fallback: use object location
+            if body_obj and part_obj:
+                direction = part_obj.location - body_obj.location
+                if direction.length > 0.001:
+                    direction.normalize()
+                    return direction
+            
+            # Last resort: use Y axis (forward direction)
+            return Vector((0, 1, 0))
+    
+    def _apply_gap_separation(self, split_objects, body_obj, gap_distance):
+        """Move split parts away from body to create gaps for workflow"""
+        for part_obj in split_objects:
+            # Don't move body
+            if part_obj == body_obj:
+                continue
+            
+            # Store original position before moving
+            original_location = Vector(part_obj.location)
+            part_obj["pet_original_location"] = list(original_location)
+            
+            # Calculate separation direction (away from body)
+            direction = self._calculate_separation_vector(body_obj, part_obj)
+            
+            # Move part along separation direction
+            offset = direction * gap_distance
+            part_obj.location = original_location + offset
+            
+            # Store metadata for potential restoration
+            part_obj["pet_gap_offset"] = list(offset)
+            part_obj["pet_has_gap"] = True
     
     def create_pivot_points_from_attachments(self, original_obj, split_objects, attachment_points):
         """

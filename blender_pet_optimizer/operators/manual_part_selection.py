@@ -16,13 +16,20 @@ import bpy_extras.view3d_utils
 
 from ..utils.spatial_selection import (
     intelligent_select_head,
+    intelligent_select_head_from_seeds,
     intelligent_select_leg,
     intelligent_select_tail,
     intelligent_select_wing,
     intelligent_select_body,
-    generic_bfs_expand
+    fill_small_surrounded_gaps,
+    generic_bfs_expand,
 )
 from ..utils import segmentation_templates
+
+
+# Performance / safety constants (aligned with manual_segment & symmetry operators)
+MAX_VERTS_DIRECT = 100000
+TIMEOUT_SECONDS = 30
 
 
 # Part definitions for each pet type
@@ -189,7 +196,7 @@ class PET_OT_click_to_assign_part(Operator):
         context.window.cursor_set('CROSSHAIR')
         
         return {'RUNNING_MODAL'}
-    
+
     def modal(self, context, event):
         """Handle modal events"""
         # ESCAPE or RIGHT CLICK: Cancel and exit
@@ -310,9 +317,14 @@ class PET_OT_click_to_assign_part(Operator):
         
         selected_verts = set()
         
+        # Orientation hint for head selection
+        scene = context.scene if hasattr(context, "scene") else None
+        settings = getattr(scene, "pet_segmentation_settings", None) if scene else None
+        invert_forward_axis = bool(getattr(settings, "invert_forward_axis", False)) if settings else False
+
         try:
             if part_type == 'head':
-                selected_verts = intelligent_select_head(start_vertex_idx, self.obj, bm)
+                selected_verts = intelligent_select_head(start_vertex_idx, self.obj, bm, invert_forward_axis=invert_forward_axis)
             elif part_type.startswith('leg_') or part_type in ('leg_l', 'leg_r'):
                 # Extract side from part_type
                 leg_side = 'left' if part_type.endswith('_l') else 'right'
@@ -387,6 +399,252 @@ class PET_OT_click_to_assign_part(Operator):
         context.view_layer.update()
 
 
+class PET_OT_auto_grow_current_selection(Operator):
+    """Auto-grow current selection for the active part using intelligent spatial logic"""
+    bl_idname = "pet.auto_grow_current_selection"
+    bl_label = "Auto-Grow Current Selection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    part_type: StringProperty(
+        name="Part Type",
+        description="Type of part to expand selection for (head, leg_front_l, etc.)"
+    )
+
+    def execute(self, context):
+        start_time = time.time()
+        obj = context.active_object
+
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "Please select a mesh object")
+            return {'CANCELLED'}
+
+        state = context.scene.pet_manual_part_selection_state
+        if not getattr(state, "is_active", False):
+            self.report({'ERROR'}, "Manual part selection is not active")
+            return {'CANCELLED'}
+
+        # Ensure Edit mode
+        if context.mode != 'EDIT':
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+        # Capture current selection as seed set and backup
+        seed_indices = {v.index for v in bm.verts if v.select}
+        if not seed_indices:
+            self.report({'WARNING'}, "No vertices selected. Select vertices for the part, then run auto-grow.")
+            return {'CANCELLED'}
+
+        original_selection = set(seed_indices)
+
+        total_verts = len(mesh.vertices)
+        use_progress = total_verts > MAX_VERTS_DIRECT
+
+        if use_progress:
+            context.window_manager.progress_begin(0, 100)
+
+        try:
+            target_part = (self.part_type or state.current_part or "").lower()
+            expanded = self._auto_expand_from_seeds(
+                obj, bm, seed_indices, target_part, context, start_time
+            )
+
+            if not expanded:
+                # Nothing better found – keep original selection
+                final_selection = original_selection
+                improved = False
+            else:
+                # Expand-only semantics: never shrink the user's selection.
+                if len(expanded) <= len(original_selection) or expanded.issubset(original_selection):
+                    final_selection = original_selection
+                    improved = False
+                else:
+                    final_selection = original_selection.union(expanded)
+                    improved = len(final_selection) > len(original_selection)
+
+            # Apply final selection (either unchanged or expanded)
+            self._apply_selection(context, obj, final_selection)
+            state.current_selection_vertex_count = len(final_selection)
+
+            elapsed = time.time() - start_time
+            part_label = get_part_display_name(target_part or 'part')
+
+            if not improved:
+                msg = (
+                    f"Auto-grow did not find additional vertices for {part_label}. "
+                    "Your current selection has been preserved."
+                )
+                # Treat timeout as informational if we didn't change anything
+                if time.time() - start_time > TIMEOUT_SECONDS:
+                    msg += " (stopped early due to timeout)."
+                self.report({'INFO'}, msg)
+            else:
+                added = len(final_selection) - len(original_selection)
+                msg = (
+                    f"Auto-selected {added:,} additional vertices "
+                    f"(total {len(final_selection):,}) for {part_label} ({elapsed:.1f}s)"
+                )
+                if time.time() - start_time > TIMEOUT_SECONDS:
+                    msg += " (stopped early due to timeout)."
+                    self.report({'WARNING'}, msg)
+                else:
+                    self.report({'INFO'}, msg)
+
+            return {'FINISHED'}
+        except Exception as e:
+            # On error, restore original selection
+            print(f"[PET_OT_auto_grow_current_selection] Error: {e}")
+            self._apply_selection(context, obj, original_selection)
+            state.current_selection_vertex_count = len(original_selection)
+            self.report({'ERROR'}, "Auto-grow failed. Original selection has been restored.")
+            return {'CANCELLED'}
+        finally:
+            if use_progress:
+                context.window_manager.progress_end()
+
+    def _auto_expand_from_seeds(self, obj, bm, seeds, part_type, context, start_time):
+        """Use part-specific intelligent selection from multiple seeds with timeout safeguards."""
+        # Limit number of seeds to avoid combinatorial explosion
+        seed_list = list(seeds)
+        MAX_SEEDS = 10
+        seed_list = seed_list[:MAX_SEEDS]
+
+        expanded = set()
+        total_verts = len(bm.verts)
+        # Generic guardrail to avoid whole-body selections for any part
+        MAX_PART_FRACTION = 0.6
+        max_part_vertices = max(500, int(total_verts * MAX_PART_FRACTION))
+
+        # Orientation hint for head selection: use segmentation settings if available
+        scene = context.scene if hasattr(context, "scene") else None
+        settings = getattr(scene, "pet_segmentation_settings", None) if scene else None
+        invert_forward_axis = bool(getattr(settings, "invert_forward_axis", False)) if settings else False
+
+        try:
+            if part_type == 'head':
+                # Use seed-set-aware helper for head to keep growth local.
+                expanded = intelligent_select_head_from_seeds(seed_list, obj, bm, invert_forward_axis=invert_forward_axis)
+            else:
+                for idx, seed in enumerate(seed_list):
+                    if time.time() - start_time > TIMEOUT_SECONDS:
+                        break
+
+                    try:
+                        if part_type.startswith('leg_') or part_type in {'leg_l', 'leg_r'}:
+                            leg_side = 'left' if part_type.endswith('_l') else 'right'
+                            leg_position = 'front' if 'front' in part_type else 'back'
+                            part_verts = intelligent_select_leg(seed, obj, bm, leg_side, leg_position)
+                        elif part_type.startswith('arm_'):
+                            arm_side = 'left' if part_type.endswith('_l') else 'right'
+                            part_verts = intelligent_select_leg(seed, obj, bm, arm_side, 'front')
+                        elif part_type == 'tail':
+                            part_verts = intelligent_select_tail(seed, obj, bm)
+                        elif part_type.startswith('wing_'):
+                            wing_side = 'left' if part_type.endswith('_l') else 'right'
+                            part_verts = intelligent_select_wing(seed, obj, bm, wing_side)
+                        elif part_type == 'body':
+                            assigned_parts = self._get_assigned_parts_for_body(obj)
+                            part_verts = intelligent_select_body(obj, bm, assigned_parts)
+                        else:
+                            part_verts = generic_bfs_expand(seed, obj, bm)
+                    except Exception as e:
+                        print(f"[PET_OT_auto_grow_current_selection] Intelligent selection error for seed {seed}: {e}")
+                        part_verts = generic_bfs_expand(seed, obj, bm)
+
+                    if part_verts:
+                        expanded.update(part_verts)
+
+                    # Lightweight progress feedback for very large meshes
+                    if len(bm.verts) > MAX_VERTS_DIRECT and idx % 2 == 0 and hasattr(context, "window_manager"):
+                        progress = min(99, int((idx + 1) / max(1, len(seed_list)) * 100))
+                        context.window_manager.progress_update(progress)
+        finally:
+            # Apply generic guardrail: if a part selection tries to eat most of the mesh,
+            # fall back to the original seeds so the user doesn't lose their work.
+            if part_type != 'body' and len(expanded) > max_part_vertices:
+                # Log a helpful message when we clamp a runaway selection
+                fraction = len(expanded) / max(1, total_verts) * 100.0
+                print(
+                    f"[PET_OT_auto_grow_current_selection] Guardrail triggered for part '{part_type}': "
+                    f"{len(expanded)} verts (~{fraction:.1f}% of mesh). "
+                    "Falling back to original seed selection."
+                )
+                expanded = set(seeds)
+
+        # Fallback: if nothing expanded beyond seeds, just return seeds
+        if not expanded:
+            return set(seeds)
+
+        # After guardrails, conservatively fill tiny, mostly-surrounded gaps.
+        # This runs for all parts and only ever ADDS vertices.
+        have_time = (time.time() - start_time) < TIMEOUT_SECONDS
+        if have_time:
+            max_total = max_part_vertices if part_type != 'body' else None
+            try:
+                expanded = fill_small_surrounded_gaps(
+                    bm,
+                    expanded,
+                    # Slightly higher cap than the head-specific call so
+                    # deeper enclosed cracks on any part can be closed,
+                    # still bounded by per-part max_total.
+                    max_gap_size=96,
+                    # Allow up to ~10% of neighbors to be external so that
+                    # mostly-enclosed strips can still be filled.
+                    neighbor_selected_ratio=0.9,
+                    max_total_vertices=max_total,
+                    start_time=start_time,
+                    timeout_seconds=TIMEOUT_SECONDS,
+                )
+            except Exception as e:
+                print(f"[PET_OT_auto_grow_current_selection] gap-fill error for part '{part_type}': {e}")
+
+        return expanded
+
+    def _get_assigned_parts_for_body(self, obj):
+        """Rebuild mapping of already assigned parts for intelligent body selection."""
+        assigned = {}
+        mesh = obj.data
+
+        for vg in obj.vertex_groups:
+            if vg.name == 'body':
+                continue
+
+            verts = set()
+            for vert in mesh.vertices:
+                for group in vert.groups:
+                    if group.group == vg.index and group.weight > 0.5:
+                        verts.add(vert.index)
+                        break
+
+            if verts:
+                assigned[vg.name] = verts
+
+        return assigned
+
+    def _apply_selection(self, context, obj, vertex_indices):
+        """Apply a vertex index set as the active Edit Mode selection."""
+        if context.mode != 'EDIT':
+            bpy.ops.object.mode_set(mode='EDIT')
+
+        mesh = obj.data
+
+        # Deselect all first
+        bpy.ops.mesh.select_all(action='DESELECT')
+
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+
+        for vidx in vertex_indices:
+            if 0 <= vidx < len(bm.verts):
+                bm.verts[vidx].select = True
+
+        bmesh.update_edit_mesh(mesh)
+
+
 class PET_OT_save_part_selection(Operator):
     """Save current selection to vertex group for the current part"""
     bl_idname = "pet.save_part_selection"
@@ -440,6 +698,12 @@ class PET_OT_save_part_selection(Operator):
         
         # Assign vertices to current part
         vg.add(selected_verts, 1.0, 'REPLACE')
+
+        # If the user is explicitly saving BODY, remember that this BODY
+        # selection was defined manually (authoritative) rather than being
+        # created by Assign Remaining to Body.
+        if current_part == 'body':
+            obj["pet_manual_body_explicit"] = True
         
         # Update completed parts list
         completed = obj.get("pet_manual_completed_parts", [])
@@ -677,41 +941,125 @@ class PET_OT_assign_body_remaining(Operator):
             self.report({'ERROR'}, "Please select a mesh object")
             return {'CANCELLED'}
         
+        # Any call to Assign Remaining to Body defines BODY automatically,
+        # so clear any explicit-body marker.
+        if "pet_manual_body_explicit" in obj:
+            del obj["pet_manual_body_explicit"]
+        
         # Switch to Object mode
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         
         mesh = obj.data
+        total_verts = len(mesh.vertices)
+        start_time = time.time()
         
-        # Find all assigned vertices
-        assigned_verts = set()
-        for vg in obj.vertex_groups:
-            if vg.name == 'body':
-                continue
-            
+        # Build mapping from vertex index -> list of non-body part names
+        vert_to_parts = {i: [] for i in range(total_verts)}
+        non_body_groups = [vg for vg in obj.vertex_groups if vg.name != 'body']
+        
+        for vg in non_body_groups:
             vg_index = vg.index
+            part_name = vg.name
             for vert in mesh.vertices:
                 for group in vert.groups:
                     if group.group == vg_index and group.weight > 0.5:
-                        assigned_verts.add(vert.index)
+                        vert_to_parts[vert.index].append(part_name)
                         break
         
-        # Find unassigned vertices
-        all_verts = set(range(len(mesh.vertices)))
-        unassigned_verts = list(all_verts - assigned_verts)
+        # Vertices with any non-body part are considered already assigned.
+        assigned_verts = {idx for idx, parts in vert_to_parts.items() if parts}
+        
+        # Find unassigned vertices (no non-body part membership)
+        unassigned_verts = [i for i in range(total_verts) if i not in assigned_verts]
         
         if not unassigned_verts:
             self.report({'INFO'}, "All vertices are already assigned")
             return {'FINISHED'}
         
-        # Get or create body vertex group
-        if 'body' in obj.vertex_groups:
-            body_vg = obj.vertex_groups['body']
+        # Build adjacency (vertex index -> neighbor indices) for components
+        neighbors = {i: [] for i in range(total_verts)}
+        for edge in mesh.edges:
+            v1, v2 = edge.vertices
+            neighbors[v1].append(v2)
+            neighbors[v2].append(v1)
+        
+        visited = set()
+        components = []
+        
+        for v_idx in unassigned_verts:
+            if v_idx in visited:
+                continue
+            comp = set()
+            queue = [v_idx]
+            visited.add(v_idx)
+            
+            while queue:
+                if time.time() - start_time > TIMEOUT_SECONDS:
+                    self.report({'WARNING'}, "Timeout while analyzing leftover components. Partial BODY assignment applied.")
+                    queue.clear()
+                    break
+                
+                current = queue.pop(0)
+                comp.add(current)
+                for nb in neighbors.get(current, []):
+                    if nb in visited or nb not in unassigned_verts:
+                        continue
+                    visited.add(nb)
+                    queue.append(nb)
+            
+            if comp:
+                components.append(comp)
+        
+        # Prepare vertex groups for reassignment
+        vg_by_name = {vg.name: vg for vg in obj.vertex_groups}
+        if 'body' in vg_by_name:
+            body_vg = vg_by_name['body']
         else:
             body_vg = obj.vertex_groups.new(name='body')
+            vg_by_name['body'] = body_vg
         
-        # Assign unassigned vertices to body
-        body_vg.add(unassigned_verts, 1.0, 'REPLACE')
+        body_vertices = set()
+        reassigned_counts = {}
+        
+        SMALL_COMPONENT_MAX = 500  # Heuristic: small islands near limbs/head
+        MIN_CONFIDENCE = 0.6       # At least 60% of contacts to a single part
+        
+        for comp in components:
+            if time.time() - start_time > TIMEOUT_SECONDS:
+                # On timeout, assign remaining components to BODY to guarantee completion
+                body_vertices.update(comp)
+                continue
+            
+            # Measure adjacency to existing non-body parts via edge contacts
+            neighbor_counts = {}
+            for v_idx in comp:
+                for nb in neighbors.get(v_idx, []):
+                    if nb in comp:
+                        continue
+                    for part_name in vert_to_parts.get(nb, []):
+                        neighbor_counts[part_name] = neighbor_counts.get(part_name, 0) + 1
+            
+            if not neighbor_counts:
+                # No strong attachment to any part – treat as BODY mass
+                body_vertices.update(comp)
+                continue
+            
+            best_part, best_count = max(neighbor_counts.items(), key=lambda kv: kv[1])
+            total_contacts = sum(neighbor_counts.values())
+            confidence = best_count / max(1, total_contacts)
+            
+            if len(comp) <= SMALL_COMPONENT_MAX and confidence >= MIN_CONFIDENCE and best_part in vg_by_name:
+                # Small island clearly attached to a single part – reassign to that part
+                part_vg = vg_by_name[best_part]
+                part_vg.add(list(comp), 1.0, 'REPLACE')
+                reassigned_counts[best_part] = reassigned_counts.get(best_part, 0) + len(comp)
+            else:
+                # Large or ambiguous component – assign to BODY
+                body_vertices.update(comp)
+        
+        if body_vertices:
+            body_vg.add(list(body_vertices), 1.0, 'REPLACE')
         
         # Update completed parts
         completed = list(obj.get("pet_manual_completed_parts", []))
@@ -719,7 +1067,13 @@ class PET_OT_assign_body_remaining(Operator):
             completed.append('body')
             obj["pet_manual_completed_parts"] = completed
         
-        self.report({'INFO'}, f"Assigned {len(unassigned_verts)} remaining vertices to BODY")
+        # Build a helpful summary message
+        body_count = len(body_vertices)
+        msg_parts = [f"Assigned {body_count} vertices to BODY"]
+        if reassigned_counts:
+            for part_name, count in reassigned_counts.items():
+                msg_parts.append(f"reassigned {count} leftover vertices to {get_part_display_name(part_name)}")
+        self.report({'INFO'}, "; ".join(msg_parts))
         return {'FINISHED'}
 
 
@@ -741,8 +1095,11 @@ class PET_OT_finish_part_selection(Operator):
             self.report({'ERROR'}, "Manual part selection is not active")
             return {'CANCELLED'}
         
-        # Auto-assign remaining to body
-        bpy.ops.pet.assign_body_remaining()
+        # Auto-assign remaining to body only if BODY has not been explicitly
+        # defined by the user via \"Use Current Selection as BODY\".
+        body_explicit = bool(obj.get("pet_manual_body_explicit", False))
+        if not body_explicit:
+            bpy.ops.pet.assign_body_remaining()
         
         # Switch to Object mode
         if context.mode != 'OBJECT':
@@ -787,6 +1144,8 @@ class PET_OT_finish_part_selection(Operator):
             del obj["pet_manual_completed_parts"]
         if "pet_manual_pet_type" in obj:
             del obj["pet_manual_pet_type"]
+        if "pet_manual_body_explicit" in obj:
+            del obj["pet_manual_body_explicit"]
         
         # Switch to Weight Paint mode for preview
         try:
@@ -825,6 +1184,8 @@ class PET_OT_cancel_part_selection(Operator):
                 del obj["pet_manual_completed_parts"]
             if "pet_manual_pet_type" in obj:
                 del obj["pet_manual_pet_type"]
+            if "pet_manual_body_explicit" in obj:
+                del obj["pet_manual_body_explicit"]
         
         # Switch to Object mode
         if context.mode != 'OBJECT':
@@ -842,6 +1203,7 @@ classes = [
     PET_OT_start_manual_part_selection,
     PET_OT_select_part_to_assign,
     PET_OT_click_to_assign_part,
+    PET_OT_auto_grow_current_selection,
     PET_OT_save_part_selection,
     PET_OT_edit_saved_part,
     PET_OT_preview_current_selection,

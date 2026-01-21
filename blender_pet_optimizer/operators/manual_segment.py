@@ -4,6 +4,8 @@ from bpy.props import StringProperty, FloatProperty, IntProperty, BoolProperty, 
 import bmesh
 import time
 
+from ..utils.spatial_selection import fill_gaps_aggressive
+
 
 MAX_VERTS_DIRECT = 100000
 CHUNK_SIZE = 50000
@@ -169,7 +171,14 @@ class PET_OT_grow_selection(Operator):
         
         for _ in range(self.iterations):
             bpy.ops.mesh.select_more()
-        
+
+        # If manual part selection is active, keep its selection count in sync
+        state = getattr(context.scene, "pet_manual_part_selection_state", None)
+        if state is not None and getattr(state, "is_active", False):
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            state.current_selection_vertex_count = sum(1 for v in bm.verts if v.select)
+
         return {'FINISHED'}
 
 
@@ -195,7 +204,14 @@ class PET_OT_shrink_selection(Operator):
         
         for _ in range(self.iterations):
             bpy.ops.mesh.select_less()
-        
+
+        # If manual part selection is active, keep its selection count in sync
+        state = getattr(context.scene, "pet_manual_part_selection_state", None)
+        if state is not None and getattr(state, "is_active", False):
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            state.current_selection_vertex_count = sum(1 for v in bm.verts if v.select)
+
         return {'FINISHED'}
 
 
@@ -222,8 +238,95 @@ class PET_OT_smooth_selection_boundary(Operator):
         for _ in range(self.iterations):
             bpy.ops.mesh.select_less()
             bpy.ops.mesh.select_more()
-        
+
+        # If manual part selection is active, keep its selection count in sync
+        state = getattr(context.scene, "pet_manual_part_selection_state", None)
+        if state is not None and getattr(state, "is_active", False):
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.verts.ensure_lookup_table()
+            state.current_selection_vertex_count = sum(1 for v in bm.verts if v.select)
+
         self.report({'INFO'}, "Smoothed selection boundary")
+        return {'FINISHED'}
+
+
+class PET_OT_fill_gaps_selection(Operator):
+    """Fill fully-surrounded cracks and small islands inside the current selection"""
+    bl_idname = "pet.fill_gaps_selection"
+    bl_label = "Fill Gaps"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH' or obj.mode != 'EDIT':
+            self.report({'ERROR'}, "Must be in Edit mode on a mesh")
+            return {'CANCELLED'}
+
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+
+        base_selection = {v.index for v in bm.verts if v.select}
+        if not base_selection:
+            self.report({'WARNING'}, "No vertices selected. Select a part, then use Fill Gaps.")
+            return {'CANCELLED'}
+
+        start_time = time.time()
+        total_verts = len(bm.verts)
+
+        # Build an exclusion mask so we don't eat vertices that already belong
+        # to other parts when manual part selection is active.
+        excluded = set()
+        state = getattr(context.scene, "pet_manual_part_selection_state", None)
+        current_part = getattr(state, "current_part", "") if state and getattr(state, "is_active", False) else ""
+
+        if current_part and obj.vertex_groups:
+            vg_by_name = {vg.name: vg for vg in obj.vertex_groups}
+            for vg_name, vg in vg_by_name.items():
+                if vg_name == current_part:
+                    continue
+                vg_index = vg.index
+                for v in mesh.vertices:
+                    # Never exclude vertices the user has explicitly selected
+                    if v.index in base_selection:
+                        continue
+                    for g in v.groups:
+                        if g.group == vg_index and g.weight > 0.5:
+                            excluded.add(v.index)
+                            break
+
+        expanded = fill_gaps_aggressive(
+            bm,
+            base_selection,
+            max_gap_size=512,
+            neighbor_selected_ratio=0.75,
+            max_total_vertices=None,
+            start_time=start_time,
+            timeout_seconds=10.0,
+            excluded_indices=excluded,
+        )
+
+        # Expand-only semantics: never shrink the user's selection.
+        final_selection = base_selection.union(expanded or set())
+
+        for v in bm.verts:
+            v.select = v.index in final_selection
+        bmesh.update_edit_mesh(mesh)
+
+        # Keep Manual Part Selection's selection count in sync if it's active.
+        if state is not None and getattr(state, "is_active", False):
+            state.current_selection_vertex_count = len(final_selection)
+
+        # Calculate added vertices - ensure all variables are defined
+        base_count = len(base_selection) if base_selection else 0
+        final_count = len(final_selection) if final_selection else 0
+        added = final_count - base_count
+        
+        if added > 0:
+            self.report({'INFO'}, f"Fill Gaps added {added:,} vertices (total {final_count:,}).")
+        else:
+            self.report({'INFO'}, "Fill Gaps did not find additional enclosed vertices. Your selection is unchanged.")
+
         return {'FINISHED'}
 
 
@@ -613,6 +716,7 @@ classes = [
     PET_OT_grow_selection,
     PET_OT_shrink_selection,
     PET_OT_smooth_selection_boundary,
+    PET_OT_fill_gaps_selection,
     PET_OT_select_linked_flat,
     PET_OT_invert_and_assign_body,
     PET_OT_quick_decimate,

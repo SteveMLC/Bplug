@@ -180,6 +180,12 @@ class PET_OT_create_r6_joints(Operator):
         default=True
     )
     
+    use_stored_pivots: BoolProperty(
+        name="Use Stored Pivot Positions",
+        description="Use pivot positions stored during split operation (at actual attachment boundaries). Recommended when gaps were created.",
+        default=True
+    )
+    
     def execute(self, context):
         scene_objects = list(context.scene.objects)
         
@@ -230,21 +236,57 @@ class PET_OT_create_r6_joints(Operator):
         
         joints_created = []
         
+        # Try to get stored attachment points from split operation
+        # CRITICAL: These positions are at actual separation boundaries (before gaps were created)
+        stored_attachments = {}
+        if self.use_stored_pivots:
+            # Look for stored attachment points in scene objects or original object
+            for obj in scene_objects:
+                if obj.type == 'MESH' and "pet_stored_attachment_points" in obj:
+                    stored_data = obj.get("pet_stored_attachment_points", {})
+                    # Convert stored string keys and list positions back to tuples and Vectors
+                    for key_str, pos_list in stored_data.items():
+                        try:
+                            # Parse key string back to tuple (e.g., "('body', 'head')")
+                            import ast
+                            key_tuple = ast.literal_eval(key_str)
+                            stored_attachments[key_tuple] = Vector(pos_list)
+                        except:
+                            continue
+                    break
+        
         for segment_name, segment_obj in segment_objects.items():
             if segment_name not in R6_JOINT_CONFIG:
                 continue
             
             config = R6_JOINT_CONFIG[segment_name]
             
-            joint_position = find_boundary_center(body_obj, segment_obj)
+            # CRITICAL: Use stored pivot position if available (at actual attachment boundary)
+            # Otherwise fallback to recalculation (may place pivot in gap center if gaps exist)
+            joint_position = None
             
+            if self.use_stored_pivots and stored_attachments:
+                # Try to find stored position for this body-segment pair
+                # Keys are tuples like ('body', 'head') or ('head', 'body')
+                key1 = ('body', segment_name)
+                key2 = (segment_name, 'body')
+                
+                if key1 in stored_attachments:
+                    joint_position = stored_attachments[key1]
+                elif key2 in stored_attachments:
+                    joint_position = stored_attachments[key2]
+            
+            # Fallback to recalculation if stored position not found
             if not joint_position:
-                body_bounds = get_segment_bounds(body_obj)
-                segment_bounds = get_segment_bounds(segment_obj)
-                if body_bounds and segment_bounds:
-                    joint_position = (body_bounds['center'] + segment_bounds['center']) / 2
-                else:
-                    continue
+                joint_position = find_boundary_center(body_obj, segment_obj)
+                
+                if not joint_position:
+                    body_bounds = get_segment_bounds(body_obj)
+                    segment_bounds = get_segment_bounds(segment_obj)
+                    if body_bounds and segment_bounds:
+                        joint_position = (body_bounds['center'] + segment_bounds['center']) / 2
+                    else:
+                        continue
             
             segment_bounds = get_segment_bounds(segment_obj)
             body_bounds = get_segment_bounds(body_obj)
