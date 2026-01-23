@@ -8,10 +8,16 @@ Complete documentation of all features, operators, and functionality available i
 - [Feature Categories](#feature-categories)
   - [Mesh Optimization](#mesh-optimization)
   - [Body Part Segmentation](#body-part-segmentation)
+  - [Edge-Cut Segmentation](#edge-cut-segmentation)
+  - [Manual Segmentation Wizard](#manual-segmentation-wizard)
+  - [Symmetry Tools](#symmetry-tools)
+  - [Animal Presets](#animal-presets)
   - [Mesh Splitting](#mesh-splitting)
   - [Rigging](#rigging)
+  - [Roblox R6 Joints](#roblox-r6-joints)
   - [Part Standardization](#part-standardization)
   - [Export](#export)
+  - [Batch Operations](#batch-operations)
 - [Technical Details](#technical-details)
 - [Naming Conventions](#naming-conventions)
 - [Data Preservation](#data-preservation)
@@ -231,6 +237,132 @@ Each vertex can belong to multiple groups (with weights), allowing smooth transi
 
 ---
 
+### Edge-Cut Segmentation
+
+**Purpose**: Alternative segmentation method using edge loop selection for precise control over cut locations.
+
+**Location**: `Pet Optimizer` N-panel → **Quick Segment (Edge Cuts)** panel.
+
+**Workflow**:
+
+1. **Select your mesh** in Object mode
+2. **Enter Edit Mode** (Tab)
+3. **Select edge loops** around appendages (head, legs, tail, wings)
+4. **Mark cuts** using segment buttons:
+   - Click **"Mark Head Cut"** to mark selected edges as head boundary
+   - Click **"Mark Legs Cut"** to mark selected edges as leg boundaries
+   - Click **"Mark Tail Cut"** to mark selected edges as tail boundary
+   - Click **"Mark Wings Cut"** to mark selected edges as wing boundaries
+5. **Apply cuts**: Click **"Apply Cuts & Create Groups"** to create vertex groups from marked edges
+6. **Split**: Click **"Split Into Parts"** to create separate objects with gaps
+
+**Operators**:
+- `PET_OT_mark_segment_cut`: Mark selected edges as cut boundary for a specific part
+- `PET_OT_apply_segment_cuts`: Create vertex groups from marked cuts
+- `PET_OT_split_by_edge_cuts`: Split mesh into parts based on edge cuts
+
+**Advantages**:
+- Precise control over cut locations
+- Works well with clean topology
+- Visual feedback during edge selection
+- Better for models with clear edge loops
+
+**When to Use**:
+- Models with clean topology and visible edge loops
+- When automatic segmentation doesn't place boundaries correctly
+- For models with unusual proportions that don't match templates
+
+---
+
+### Manual Segmentation Wizard
+
+**Purpose**: Step-by-step wizard for manually assigning vertices to body parts.
+
+**Location**: `Pet Optimizer` N-panel → **Manual Segment** panel.
+
+**Workflow**:
+
+1. **Select your mesh** in Object mode
+2. **Enter Edit Mode** (Tab)
+3. **Select vertices** for a specific part (e.g., head)
+4. **Assign to part**: Click part button (e.g., **"Assign to Head"**)
+5. **Repeat** for each part (legs, tail, wings)
+6. **Assign remaining**: Click **"Assign Remaining as Body"** to assign unselected vertices to body
+7. **Split**: Use **"Split Into Parts"** from Segmentation panel to create separate objects
+
+**Operators**:
+- Multiple operators for each body part assignment
+- State management for wizard workflow
+- Visual feedback in Edit mode
+
+**Advantages**:
+- Full manual control
+- Works with any model topology
+- Can refine automatic segmentation results
+
+**When to Use**:
+- Models that don't work with automatic segmentation
+- When you need precise control over part boundaries
+- To fix or refine automatic segmentation results
+
+---
+
+### Symmetry Tools
+
+**Purpose**: Detect and work with symmetrical models, mirror selections, and symmetrize vertex groups.
+
+**Location**: `Pet Optimizer` N-panel → **Symmetry Tools** panel.
+
+**Operators**:
+
+#### Detect Symmetry
+- `PET_OT_detect_symmetry`: Analyzes mesh to find symmetry plane
+- Detects X, Y, or Z-axis symmetry
+- Reports symmetry accuracy percentage
+
+#### Mirror Selection
+- `PET_OT_mirror_selection`: Mirrors selected vertices/edges/faces across symmetry plane
+- Useful for making one-sided edits affect both sides
+
+#### Select Half
+- `PET_OT_select_half`: Selects one half of symmetrical mesh
+- Can select left, right, top, bottom, front, or back half
+
+#### Symmetrize Segments
+- `PET_OT_symmetrize_segments`: Copies vertex group assignments from one side to the other
+- Ensures symmetrical segmentation for symmetrical models
+
+**Use Cases**:
+- Working with symmetrical animal models
+- Ensuring left/right parts match exactly
+- Making edits on one side affect both sides
+- Cleaning up asymmetrical segmentation
+
+---
+
+### Animal Presets
+
+**Purpose**: Pre-configured templates for common animal types with optimized proportions and settings.
+
+**Location**: `Pet Optimizer` N-panel → **Symmetry Tools** panel (preset selector).
+
+**Available Presets**:
+- **Dog**: Optimized for canine proportions
+- **Cat**: Optimized for feline proportions
+- **Horse**: Optimized for equine proportions
+- **Bird**: Optimized for avian proportions
+- **Custom**: User-defined settings
+
+**Features**:
+- Proportion hints for segmentation
+- Optimized detection sensitivity
+- Pre-configured bone hierarchy suggestions
+- Standard attachment point locations
+
+**Note**: Presets provide proportion hints and optimization suggestions. Segmentation operators use `segmentation_templates.py` for actual detection, but presets can guide parameter selection.
+
+---
+
 ### Mesh Splitting
 
 **Purpose**: Convert vertex groups into separate mesh objects while preserving all mesh data.
@@ -254,6 +386,7 @@ The splitter preserves:
 - **Keep Original**: Retains the original combined mesh object (recommended for non-destructive workflow)
 - **Verify Data**: Validates data preservation before splitting (checks for UV layers, materials, etc.)
 - **Create Pivots**: Generates Empty objects at attachment points between parts
+- **Gap Distance**: Distance to separate parts after splitting (default: 0.1). Creates visible gaps for post-processing workflow.
 
 #### Attachment Points (Pivots)
 
@@ -265,7 +398,9 @@ When "Create Pivots" is enabled, the splitter creates Empty objects at standard 
 
 These pivot points:
 - Are positioned at geometric boundaries between parts
+- **Calculated BEFORE gaps are created** (critical for R6 joints)
 - Include custom properties (`pet_pivot_type`, `pet_source_part`, `pet_target_part`)
+- Stored in metadata as `pet_stored_attachment_points` for R6 joint creation
 - Can be used for rigging or export metadata
 - Appear in a collection named `{ObjectName}_Pivots`
 
@@ -336,6 +471,64 @@ The "Setup Rig" operator performs additional rigging tasks:
 - Applies constraint setups (if needed)
 - Optimizes weight distribution
 - Validates rig integrity
+
+---
+
+### Roblox R6 Joints
+
+**Purpose**: Create Motor6D joints at correct attachment boundaries for Roblox Studio animation.
+
+**Location**: `Pet Optimizer` N-panel → **Roblox R6 Joints** panel.
+
+**Operators**:
+- `PET_OT_create_r6_joints`: Creates Motor6D joints with correct C0/C1 transforms
+- `PET_OT_export_r6_metadata`: Exports joint information as JSON for Roblox import scripts
+- `PET_OT_visualize_r6_hierarchy`: Visualizes joint hierarchy in viewport
+
+#### Critical: Pivot Point Logic
+
+**⚡ WHERE APPENDAGE SEPARATES FROM BODY = WHERE PIVOT POINT MUST BE**
+
+- Pivot points are **calculated BEFORE gaps are created** (from vertex group boundaries)
+- Stored in object metadata as `pet_stored_attachment_points`
+- **NOT recalculated after gaps** (would place in gap center - WRONG)
+- Must use stored positions for correct joint placement
+
+#### Workflow
+
+1. **Split mesh into parts** (pivot positions stored during split)
+2. **Select all split parts** (body + appendages)
+3. **Open Roblox R6 Joints panel**
+4. **Configure Options**:
+   - `Joint Scale`: Size of joint visualization (default: 0.1)
+   - **`Use Stored Pivot Positions`: ON** ⚠️ **CRITICAL**
+   - `Calculate Offsets from Mesh`: ON (recommended)
+5. **Click "Create R6 Joints"**
+
+#### What Happens
+
+- ✅ **Reads stored pivot positions** from object metadata
+- ✅ **Uses positions calculated BEFORE gaps** (at actual boundaries)
+- ✅ Creates Motor6D joints with correct C0/C1 transforms
+- ✅ Joints placed where appendage meets body (not in gap center)
+- ✅ Creates Empty objects in "R6_Joints" collection
+- ✅ Each joint includes metadata for Roblox import scripts
+
+#### C0/C1 Transforms
+
+- **C0**: Transform from Part0 (body) center to joint in body's local space
+- **C1**: Transform from Part1 (appendage) center to joint in appendage's local space
+- Both calculated using stored pivot positions (correct boundaries)
+
+#### Export R6 Metadata
+
+Exports joint information as JSON:
+- Joint names, types, positions
+- C0/C1 transforms (matrices)
+- Part associations
+- Attachment point data
+
+Use with Roblox import scripts for automated Motor6D joint setup.
 
 ---
 
@@ -467,6 +660,46 @@ export_directory/
 
 ---
 
+### Batch Operations
+
+**Purpose**: Process multiple models or scenes automatically for workflow automation.
+
+**Location**: `Pet Optimizer` N-panel → **Batch Operations** panel.
+
+**Operators**:
+- `PET_OT_batch_export_models`: Export multiple models in one operation
+- `PET_OT_batch_process_scene`: Apply operations to all models in scene
+- `PET_OT_list_models`: List all models in scene with their status
+
+#### Batch Export
+
+**Workflow**:
+1. Select multiple models or use scene-wide selection
+2. Configure export settings (format, include metadata, etc.)
+3. Choose export directory
+4. Click "Batch Export Models"
+5. All models exported with standardized naming
+
+**Use Cases**:
+- Exporting entire part libraries
+- Processing multiple character models
+- Creating standardized export sets
+
+#### Batch Process Scene
+
+**Workflow**:
+1. Open scene with multiple models
+2. Select operations to apply (segmentation, optimization, etc.)
+3. Click "Batch Process Scene"
+4. All models processed with same settings
+
+**Use Cases**:
+- Processing multiple models with same workflow
+- Standardizing multiple models at once
+- Automated pipeline processing
+
+---
+
 ## Technical Details
 
 ### Algorithm Implementations
@@ -549,6 +782,7 @@ All naming follows standards defined in `data/body_part_labels.json`:
 ### Collections
 - Pivot points: `{ObjectName}_Pivots`
 - Split parts: Same collection as original (or user-selected)
+- R6 Joints: `R6_Joints`
 
 ---
 
@@ -628,4 +862,4 @@ Exported models are compatible with Roblox Studio:
 
 ---
 
-For installation and usage instructions, see [README.md](README.md)
+For installation and usage instructions, see [README.md](../README.md) and [WORKFLOW_GUIDE.md](WORKFLOW_GUIDE.md)

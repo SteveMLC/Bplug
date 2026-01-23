@@ -524,6 +524,17 @@ def clean_mesh_for_decimation(
                     result['degenerate_dissolved'] = len(dissolved.get('region', []))
                 else:
                     result['degenerate_dissolved'] = 0
+                
+                # After dissolve_degenerate, explicitly remove zero-area faces
+                # dissolve_degenerate works on edges, but may miss some zero-area faces
+                try:
+                    bm.faces.ensure_lookup_table()
+                    degenerate_faces = [f for f in bm.faces if f.calc_area() < 1e-8]
+                    if degenerate_faces:
+                        bmesh.ops.delete(bm, geom=degenerate_faces, context='FACES')
+                        result['degenerate_dissolved'] += len(degenerate_faces)
+                except Exception as e:
+                    pass  # Continue even if this fails
             except Exception as e:
                 # dissolve_degenerate can fail on some meshes - continue anyway
                 result['degenerate_dissolved'] = 0

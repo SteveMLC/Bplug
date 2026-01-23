@@ -202,6 +202,12 @@ class PET_OT_clean_mesh(Operator):
         default=True
     )
     
+    fix_non_manifold: BoolProperty(
+        name="Fix Non-Manifold",
+        description="Remove duplicate faces causing non-manifold edges",
+        default=True
+    )
+    
     @classmethod
     def poll(cls, context):
         obj = context.active_object

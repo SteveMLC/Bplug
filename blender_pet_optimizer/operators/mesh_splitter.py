@@ -389,6 +389,68 @@ def calculate_attachment_points_from_vertex_groups(obj):
     return attachment_points
 
 
+def create_pivot_points_from_attachments(original_obj, split_objects, attachment_points):
+    """
+    Create pivot points using pre-calculated attachment positions.
+    Standalone function that can be called by any operator.
+    
+    Args:
+        original_obj: Original object before splitting
+        split_objects: List of objects created from splitting
+        attachment_points: dict from calculate_attachment_points_from_vertex_groups()
+    
+    Returns:
+        list: Empty objects representing pivot points
+    """
+    pivots = []
+    
+    # Create collection for pivots
+    pivot_collection_name = f"{original_obj.name}_Pivots"
+    pivot_collection = None
+    
+    for collection in bpy.data.collections:
+        if collection.name == pivot_collection_name:
+            pivot_collection = collection
+            break
+    
+    if not pivot_collection:
+        pivot_collection = bpy.data.collections.new(pivot_collection_name)
+        bpy.context.scene.collection.children.link(pivot_collection)
+    
+    # Create Empty objects at attachment points
+    for (g1, g2), position in attachment_points.items():
+        # Find corresponding split objects
+        obj1 = next((o for o in split_objects if g1 in o.name), None)
+        obj2 = next((o for o in split_objects if g2 in o.name), None)
+        
+        if obj1 and obj2:
+            # Create Empty object at pivot location
+            bpy.ops.object.empty_add(
+                type='ARROWS',
+                location=position,
+                scale=(0.15, 0.15, 0.15)
+            )
+            pivot = bpy.context.active_object
+            pivot.name = f"{g1}_Pivot_{g2}"
+            
+            # Add metadata
+            pivot["pet_pivot_type"] = "disconnect"
+            pivot["pet_source_part"] = g1
+            pivot["pet_target_part"] = g2
+            pivot["pet_original_mesh"] = original_obj.name
+            
+            # Link to pivot collection, then unlink from current collection(s)
+            pivot_collection.objects.link(pivot)
+            # Unlink from all collections the pivot is currently in (except our pivot collection)
+            for collection in list(pivot.users_collection):  # Use list() to avoid modifying while iterating
+                if collection != pivot_collection:
+                    collection.objects.unlink(pivot)
+            
+            pivots.append(pivot)
+    
+    return pivots
+
+
 class PET_OT_split_by_vertex_groups(Operator):
     """Split mesh into separate objects by vertex groups with full data preservation"""
     bl_idname = "pet.split_by_vertex_groups"
@@ -797,7 +859,7 @@ class PET_OT_split_by_vertex_groups(Operator):
             # Create pivot points using pre-calculated positions (BEFORE deleting original)
             # Pivot positions are at original attachment boundaries (before gaps)
             if create_pivots and attachment_points and created_objects:
-                pivots = self.create_pivot_points_from_attachments(obj, created_objects, attachment_points)
+                pivots = create_pivot_points_from_attachments(obj, created_objects, attachment_points)
                 all_pivots.extend(pivots)
             
             # Optionally delete original object (AFTER creating pivots)
@@ -1549,66 +1611,6 @@ class PET_OT_split_by_vertex_groups(Operator):
         
         return 0
     
-    def create_pivot_points_from_attachments(self, original_obj, split_objects, attachment_points):
-        """
-        Create pivot points using pre-calculated attachment positions
-        
-        Args:
-            original_obj: Original object before splitting
-            split_objects: List of objects created from splitting
-            attachment_points: dict from calculate_attachment_points_from_vertex_groups()
-        
-        Returns:
-            list: Empty objects representing pivot points
-        """
-        pivots = []
-        
-        # Create collection for pivots
-        pivot_collection_name = f"{original_obj.name}_Pivots"
-        pivot_collection = None
-        
-        for collection in bpy.data.collections:
-            if collection.name == pivot_collection_name:
-                pivot_collection = collection
-                break
-        
-        if not pivot_collection:
-            pivot_collection = bpy.data.collections.new(pivot_collection_name)
-            bpy.context.scene.collection.children.link(pivot_collection)
-        
-        # Create Empty objects at attachment points
-        for (g1, g2), position in attachment_points.items():
-            # Find corresponding split objects
-            obj1 = next((o for o in split_objects if g1 in o.name), None)
-            obj2 = next((o for o in split_objects if g2 in o.name), None)
-            
-            if obj1 and obj2:
-                # Create Empty object at pivot location
-                bpy.ops.object.empty_add(
-                    type='ARROWS',
-                    location=position,
-                    scale=(0.15, 0.15, 0.15)
-                )
-                pivot = bpy.context.active_object
-                pivot.name = f"{g1}_Pivot_{g2}"
-                
-                # Add metadata
-                pivot["pet_pivot_type"] = "disconnect"
-                pivot["pet_source_part"] = g1
-                pivot["pet_target_part"] = g2
-                pivot["pet_original_mesh"] = original_obj.name
-                
-                # Link to pivot collection, then unlink from current collection(s)
-                pivot_collection.objects.link(pivot)
-                # Unlink from all collections the pivot is currently in (except our pivot collection)
-                for collection in list(pivot.users_collection):  # Use list() to avoid modifying while iterating
-                    if collection != pivot_collection:
-                        collection.objects.unlink(pivot)
-                
-                pivots.append(pivot)
-        
-        return pivots
-    
     def create_pivot_points(self, original_obj, split_objects):
         """
         Create pivot points at boundaries between split objects
@@ -1692,8 +1694,411 @@ class PET_OT_split_by_vertex_groups(Operator):
         return boundary_center
 
 
+class PET_OT_split_clean(Operator):
+    """
+    Split pre-cleaned mesh strictly by vertex groups without expansion.
+    
+    Use this operator when:
+    - Mesh has been cleaned (no loose vertices/edges)
+    - Vertex groups have been precisely assigned via manual segmentation
+    - Boundary lines have been set during mesh cleaning
+    - You want parts to contain ONLY the highlighted/assigned vertices
+    
+    Unlike the standard split, this operator:
+    - Does NOT expand selections via spatial bounding boxes
+    - Does NOT fill internal gaps or surrounded vertices
+    - Does NOT flood-fill to adjacent faces
+    - ONLY includes faces where the majority of vertices are in the vertex group
+    """
+    bl_idname = "pet.split_clean"
+    bl_label = "Clean Split"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    create_pivots: BoolProperty(
+        name="Create Pivot Points",
+        description="Create pivot points at disconnect boundaries",
+        default=True
+    )
+    
+    keep_original: BoolProperty(
+        name="Keep Original",
+        description="Keep original mesh after splitting",
+        default=True
+    )
+    
+    verify_data: BoolProperty(
+        name="Verify Data Preservation",
+        description="Verify that UVs, colors, and materials are preserved",
+        default=True
+    )
+    
+    def execute(self, context):
+        obj = context.active_object
+        
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "Please select a mesh object")
+            return {'CANCELLED'}
+        
+        if not obj.vertex_groups:
+            self.report({'ERROR'}, "No vertex groups found. Please segment the model first.")
+            return {'CANCELLED'}
+        
+        # Ensure we're in object mode
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        
+        # Get settings from scene properties (fallback to operator properties)
+        try:
+            settings = context.scene.pet_split_settings
+            keep_original = settings.keep_original if hasattr(settings, 'keep_original') else self.keep_original
+            verify_data = settings.verify_data if hasattr(settings, 'verify_data') else self.verify_data
+            create_pivots = settings.create_pivots if hasattr(settings, 'create_pivots') else self.create_pivots
+            strict_mode = settings.strict_mode if hasattr(settings, 'strict_mode') else False
+        except AttributeError:
+            keep_original = self.keep_original
+            verify_data = self.verify_data
+            create_pivots = self.create_pivots
+            strict_mode = False
+        
+        mesh = obj.data
+        created_objects = []
+        all_pivots = []
+        verification_warnings = []
+        
+        # Calculate attachment points BEFORE splitting (using original mesh)
+        attachment_points = {}
+        if create_pivots:
+            attachment_points = calculate_attachment_points_from_vertex_groups(obj)
+            if attachment_points:
+                stored_points = {}
+                for key, pos in attachment_points.items():
+                    stored_points[str(key)] = list(pos)
+                obj["pet_stored_attachment_points"] = stored_points
+                obj["pet_attachment_points_created"] = True
+        
+        try:
+            # Sort vertex groups: process body LAST
+            # Body acts as catch-all for any remaining geometry
+            vertex_groups_list = list(obj.vertex_groups)
+            body_names = {'body', 'torso', 'core', 'Body', 'Torso', 'Core', 'BODY', 'TORSO', 'CORE'}
+            
+            def get_processing_priority(vg):
+                """Return 1 for body (process last), 0 for appendages (process first)"""
+                return 1 if vg.name in body_names else 0
+            
+            vertex_groups_list.sort(key=get_processing_priority)
+            
+            # =============================================================================
+            # TWO-PHASE CLEAN SPLIT ALGORITHM
+            # =============================================================================
+            # Phase 1: Pre-partition all faces BEFORE any mesh modification
+            # Phase 2: Separate by partition, with body as absolute catch-all
+            #
+            # This eliminates the face index invalidation problem that caused orphans
+            # =============================================================================
+            
+            # PHASE 1: Build complete face partition map
+            # Build vertex masks for ALL vertex groups upfront
+            self.report({'INFO'}, "Phase 1: Building face partition map...")
+            vertex_group_masks = {}
+            vertex_group_indices = {}
+            
+            for vg in vertex_groups_list:
+                vg_index = obj.vertex_groups.find(vg.name)
+                if vg_index == -1:
+                    continue
+                    
+                vertex_group_indices[vg.name] = vg_index
+                mask = [False] * len(mesh.vertices)
+                
+                for vertex in mesh.vertices:
+                    for group in vertex.groups:
+                        if group.group == vg_index and group.weight > 0.5:
+                            mask[vertex.index] = True
+                            break
+                
+                vertex_group_masks[vg.name] = mask
+            
+            # Store original vertex coordinates for coordinate-based mapping
+            # CRITICAL: After each separate(), Blender re-indexes vertices
+            # We need coordinates to map current vertices back to original indices
+            original_vertex_coords = {}
+            for vert_idx, vertex in enumerate(mesh.vertices):
+                original_vertex_coords[vert_idx] = Vector(vertex.co)
+            
+            # Build coordinate-to-index lookup for fast matching
+            # Use rounded coordinates as keys to handle floating-point precision
+            coord_tolerance = 0.0001
+            original_coord_to_index = {}
+            for vert_idx, coord in original_vertex_coords.items():
+                # Round coordinates to tolerance for matching
+                coord_key = (
+                    round(coord.x / coord_tolerance) * coord_tolerance,
+                    round(coord.y / coord_tolerance) * coord_tolerance,
+                    round(coord.z / coord_tolerance) * coord_tolerance
+                )
+                original_coord_to_index[coord_key] = vert_idx
+            
+            # Assign each face to exactly ONE vertex group based on vertex membership
+            import bmesh
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+            bm.faces.ensure_lookup_table()
+            
+            face_partition = {}  # face_index -> vertex_group_name
+            
+            for face in bm.faces:
+                best_group = None
+                best_count = 0
+                
+                # Find vertex group with most vertices in this face
+                for vg_name, mask in vertex_group_masks.items():
+                    verts_in_group = sum(1 for v in face.verts if v.index < len(mask) and mask[v.index])
+                    
+                    # In strict mode, require all vertices; otherwise just track best
+                    if strict_mode:
+                        if verts_in_group == len(face.verts):
+                            best_group = vg_name
+                            best_count = verts_in_group
+                            break
+                    else:
+                        # Track the group with the most vertices
+                        if verts_in_group > best_count:
+                            best_count = verts_in_group
+                            best_group = vg_name
+                
+                # Assign face to best group if it has at least one vertex
+                # Faces with no vertices in ANY group will be caught by body (last)
+                if best_group and best_count > 0:
+                    face_partition[face.index] = best_group
+            
+            bm.free()
+            
+            self.report({'INFO'}, f"Partitioned {len(face_partition)} faces across {len(vertex_group_masks)} vertex groups")
+            
+            # PHASE 2: Separate mesh by partition
+            # Process appendages first, body last
+            # Body takes ALL remaining faces (absolute catch-all)
+            self.report({'INFO'}, "Phase 2: Separating mesh by partition...")
+            
+            for vg in vertex_groups_list:
+                # Detect if this is the body vertex group
+                is_body = vg.name in body_names or vg.name.lower() in {n.lower() for n in body_names}
+                
+                # Skip if no faces assigned to this group (unless it's body)
+                faces_for_this_group = [f_idx for f_idx, vg_name in face_partition.items() if vg_name == vg.name]
+                if not faces_for_this_group and not is_body:
+                    continue
+                
+                # Re-acquire object reference (it changes after each separate)
+                original_obj = None
+                for o in bpy.context.scene.objects:
+                    if o == obj or (o.name == obj.name and o.type == 'MESH'):
+                        original_obj = o
+                        break
+                
+                if not original_obj:
+                    self.report({'ERROR'}, "Lost reference to original object during split")
+                    break
+                
+                # Check if original mesh still has faces
+                if not original_obj.data.polygons:
+                    # All faces have been separated - we're done
+                    break
+                
+                context.view_layer.objects.active = original_obj
+                original_obj.select_set(True)
+                
+                if context.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                
+                current_mesh = original_obj.data
+                
+                # Get vertex mask for this group
+                vertex_mask = vertex_group_masks.get(vg.name, [])
+                if not vertex_mask and not is_body:
+                    continue
+                
+                # Switch to edit mode for face selection
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='DESELECT')
+                bpy.ops.mesh.select_mode(type='FACE')
+                
+                bm = bmesh.from_edit_mesh(current_mesh)
+                bm.faces.ensure_lookup_table()
+                bm.verts.ensure_lookup_table()
+                
+                # Build mapping from current mesh vertices to original mesh indices
+                # CRITICAL: After each separate(), Blender re-indexes vertices
+                # We must use coordinates to match current vertices back to original indices
+                current_to_original_map = {}  # {current_bm_vert: original_mesh_index}
+                coord_tolerance = 0.0001
+                
+                for bm_vert in bm.verts:
+                    # Try direct index first (works for first iteration only)
+                    original_idx = None
+                    if bm_vert.index < len(original_vertex_coords):
+                        orig_coord = original_vertex_coords[bm_vert.index]
+                        if (bm_vert.co - orig_coord).length < coord_tolerance:
+                            original_idx = bm_vert.index
+                    
+                    # Fallback: search by coordinate matching
+                    if original_idx is None:
+                        coord_key = (
+                            round(bm_vert.co.x / coord_tolerance) * coord_tolerance,
+                            round(bm_vert.co.y / coord_tolerance) * coord_tolerance,
+                            round(bm_vert.co.z / coord_tolerance) * coord_tolerance
+                        )
+                        original_idx = original_coord_to_index.get(coord_key)
+                        
+                        # If still not found, do linear search (should be rare)
+                        if original_idx is None:
+                            for orig_idx, orig_coord in original_vertex_coords.items():
+                                if (bm_vert.co - orig_coord).length < coord_tolerance:
+                                    original_idx = orig_idx
+                                    break
+                    
+                    if original_idx is not None:
+                        current_to_original_map[bm_vert] = original_idx
+                    else:
+                        # This should never happen, but log a warning
+                        print(f"[Clean Split] WARNING: Could not map vertex at {bm_vert.co} to original mesh")
+                
+                # Select faces based on vertex group membership
+                # Cannot use face indices (they're invalid after previous separations)
+                # Must use vertex membership to determine selection
+                faces_selected = 0
+                
+                for face in bm.faces:
+                    if is_body:
+                        # BODY IS ABSOLUTE CATCH-ALL: Select ALL remaining faces
+                        # This ensures ZERO orphans
+                        face.select = True
+                        faces_selected += 1
+                    else:
+                        # Appendages: Select faces where majority of vertices are in this group
+                        # Use vertex membership to determine selection (robust after mesh changes)
+                        # CRITICAL: Use coordinate-based mapping to get original vertex index
+                        # v.index is from the modified mesh, but vertex_mask uses original indices
+                        verts_in_group = 0
+                        for v in face.verts:
+                            original_idx = current_to_original_map.get(v)
+                            if original_idx is not None and original_idx < len(vertex_mask) and vertex_mask[original_idx]:
+                                verts_in_group += 1
+                        total_verts = len(face.verts)
+                        
+                        if strict_mode:
+                            # Strict: ALL vertices must be in the group
+                            if verts_in_group == total_verts:
+                                face.select = True
+                                faces_selected += 1
+                        else:
+                            # Standard: Majority (>50%) must be in the group
+                            if verts_in_group > total_verts / 2:
+                                face.select = True
+                                faces_selected += 1
+                
+                bmesh.update_edit_mesh(current_mesh)
+                bm.free()
+                
+                if faces_selected == 0:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    self.report({'INFO'}, f"No faces selected for {vg.name}, skipping")
+                    continue
+                
+                # Ensure we're in edit mode
+                if context.mode != 'EDIT':
+                    bpy.ops.object.mode_set(mode='EDIT')
+                
+                # Separate selected faces into new object
+                self.report({'INFO'}, f"Separating {faces_selected} faces for {vg.name}")
+                bpy.ops.mesh.separate(type='SELECTED')
+                bpy.ops.object.mode_set(mode='OBJECT')
+                
+                # Find newly created object
+                all_mesh_objs = [o for o in context.selected_objects if o.type == 'MESH']
+                new_objs = [o for o in all_mesh_objs if o != original_obj and o not in created_objects]
+                
+                if new_objs:
+                    new_obj = new_objs[0]
+                    new_obj.name = f"{original_obj.name}_{vg.name}"
+                    
+                    # Store source vertex group info
+                    new_obj["pet_source_vertex_group"] = vg.name
+                    new_obj["pet_split_method"] = "clean"
+                    
+                    # Verify data preservation if requested
+                    if verify_data:
+                        is_valid, warnings = verify_split_data_preservation(original_obj, new_obj, vg.name)
+                        if warnings:
+                            verification_warnings.extend([f"{vg.name}: {w}" for w in warnings])
+                    
+                    created_objects.append(new_obj)
+                    self.report({'INFO'}, f"Created {new_obj.name} with {len(new_obj.data.vertices)} vertices")
+                else:
+                    self.report({'WARNING'}, f"Failed to split vertex group: {vg.name}")
+            
+            # Create pivot points using pre-calculated positions
+            if create_pivots and attachment_points and created_objects:
+                pivots = create_pivot_points_from_attachments(obj, created_objects, attachment_points)
+                all_pivots.extend(pivots)
+            
+            # VERIFY NO ORPHANS: Check if original mesh still has faces
+            # With the two-phase algorithm and body as catch-all, this should ALWAYS be zero
+            orphan_faces = 0
+            orphan_verts = 0
+            if obj and obj.data:
+                orphan_faces = len(obj.data.polygons)
+                orphan_verts = len(obj.data.vertices)
+                
+                if orphan_faces > 0:
+                    # CRITICAL ERROR: This should NEVER happen with two-phase algorithm!
+                    self.report({'ERROR'}, f"CRITICAL: {orphan_faces:,} orphan faces ({orphan_verts:,} vertices) remain!")
+                    self.report({'ERROR'}, "Body catch-all failed! This is a bug in the algorithm.")
+                    # Don't return cancelled - user can still work with the split objects
+                else:
+                    self.report({'INFO'}, f"SUCCESS: Zero orphans - all {len(mesh.polygons)} faces assigned")
+            
+            # Optionally delete original object
+            original_obj_deleted = False
+            if not keep_original and created_objects:
+                if orphan_faces == 0:
+                    # Only delete if completely clean (zero orphans)
+                    try:
+                        bpy.data.objects.remove(obj, do_unlink=True)
+                        original_obj_deleted = True
+                        self.report({'INFO'}, "Original mesh deleted (clean split)")
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Could not delete original object: {str(e)}")
+                else:
+                    self.report({'WARNING'}, f"Keeping original mesh - orphan faces detected")
+            
+            # Report results
+            result_msg = f"Clean split into {len(created_objects)} objects"
+            if all_pivots:
+                result_msg += f" with {len(all_pivots)} pivot points"
+            if orphan_faces == 0:
+                result_msg += " - Complete (no orphans)"
+            elif orphan_faces > 0 and not original_obj_deleted:
+                result_msg += f" - WARNING: {orphan_faces:,} orphan faces remain"
+            if verification_warnings:
+                result_msg += f" ({len(verification_warnings)} warnings)"
+                for warning in verification_warnings[:3]:
+                    self.report({'WARNING'}, warning)
+            
+            self.report({'INFO'}, result_msg)
+            return {'FINISHED'}
+            
+        except Exception as e:
+            import traceback
+            self.report({'ERROR'}, f"Clean split failed: {str(e)}")
+            print(f"Clean split error traceback:\n{traceback.format_exc()}")
+            return {'CANCELLED'}
+
+
 classes = [
     PET_OT_split_by_vertex_groups,
+    PET_OT_split_clean,
 ]
 
 def register():

@@ -7,7 +7,7 @@ import bpy
 import bmesh
 import time
 from bpy.types import Operator
-from bpy.props import BoolProperty, EnumProperty, FloatVectorProperty
+from bpy.props import BoolProperty, EnumProperty, FloatVectorProperty, IntProperty, FloatProperty
 from mathutils import Vector
 
 
@@ -144,6 +144,101 @@ def extract_primary_material_color(original_obj, split_obj):
             pass
     
     return None
+
+
+def sample_color_from_adjacent_faces(bm, obj, boundary_edges, depth=2):
+    """
+    Sample material color from faces adjacent to boundary edges, traversing a few vertices deep.
+    
+    This avoids black border cuts by sampling from faces that are a few vertices away
+    from the actual boundary, ensuring we get the true material color.
+    
+    Args:
+        bm: bmesh object
+        obj: Blender object (for material access)
+        boundary_edges: set of boundary edges to sample from
+        depth: number of vertices to traverse inward (default 2)
+    
+    Returns:
+        tuple: RGB color (0.0-1.0) or None if no color found
+    """
+    if not boundary_edges or not obj.data.materials:
+        return None
+    
+    collected_faces = set()
+    boundary_verts = set()
+    
+    # Collect boundary vertices
+    for edge in boundary_edges:
+        boundary_verts.add(edge.verts[0])
+        boundary_verts.add(edge.verts[1])
+        # Get adjacent face (boundary edges have exactly one face)
+        if len(edge.link_faces) == 1:
+            collected_faces.add(edge.link_faces[0])
+    
+    # Traverse depth levels inward from boundary
+    current_verts = boundary_verts.copy()
+    for level in range(depth):
+        next_verts = set()
+        for vert in current_verts:
+            # Get all faces connected to this vertex
+            for face in vert.link_faces:
+                collected_faces.add(face)
+            # Get neighboring vertices (one step inward)
+            for edge in vert.link_edges:
+                if edge not in boundary_edges:
+                    neighbor = edge.other_vert(vert)
+                    if neighbor not in boundary_verts:
+                        next_verts.add(neighbor)
+        current_verts = next_verts
+    
+    # Extract colors from collected faces
+    colors = []
+    for face in collected_faces:
+        mat_idx = face.material_index
+        if 0 <= mat_idx < len(obj.data.materials):
+            mat = obj.data.materials[mat_idx]
+            if not mat:
+                continue
+            
+            face_color = None
+            
+            # Try Principled BSDF base color
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        base_color_input = node.inputs.get('Base Color')
+                        if base_color_input:
+                            try:
+                                color = base_color_input.default_value
+                                if len(color) >= 3 and all(0.0 <= c <= 1.0 for c in color[:3]):
+                                    face_color = (color[0], color[1], color[2])
+                                    break
+                            except (AttributeError, TypeError, IndexError):
+                                pass
+            
+            # Fallback to diffuse color
+            if face_color is None:
+                if hasattr(mat, 'diffuse_color'):
+                    try:
+                        color = mat.diffuse_color
+                        if len(color) >= 3 and all(0.0 <= c <= 1.0 for c in color[:3]):
+                            face_color = (color[0], color[1], color[2])
+                    except (AttributeError, TypeError, IndexError):
+                        pass
+            
+            if face_color is not None:
+                colors.append(face_color)
+    
+    if not colors:
+        return None
+    
+    # Average all collected colors
+    total = Vector((0, 0, 0))
+    for color in colors:
+        total += Vector(color[:3])
+    avg_color = total / len(colors)
+    return tuple(avg_color[:3])
 
 
 def build_spatial_index(stored_boundaries, tolerance=0.001):
@@ -397,6 +492,49 @@ def build_edge_loop(start_edge, boundary_edges, processed_edges, start_time, tim
     return None
 
 
+def smooth_filled_faces(bm, filled_faces, iterations=2, factor=0.6):
+    """
+    Smooth vertices of filled faces to blend with surrounding mesh.
+    
+    Args:
+        bm: bmesh object
+        filled_faces: list/set of bmesh faces to smooth
+        iterations: number of smoothing passes
+        factor: smoothing strength (0.0-1.0)
+    """
+    if not filled_faces:
+        return
+    
+    # Collect vertices from filled faces
+    verts_to_smooth = set()
+    for face in filled_faces:
+        try:
+            if face.is_valid:
+                for vert in face.verts:
+                    verts_to_smooth.add(vert)
+        except (AttributeError, RuntimeError):
+            # Face might have been invalidated, skip it
+            continue
+    
+    if not verts_to_smooth:
+        return
+    
+    # Apply smoothing iterations
+    for _ in range(iterations):
+        try:
+            bmesh.ops.smooth_vert(
+                bm,
+                verts=list(verts_to_smooth),
+                factor=factor,
+                use_axis_x=True,
+                use_axis_y=True,
+                use_axis_z=True
+            )
+        except (ValueError, RuntimeError):
+            # Smoothing failed, skip this iteration
+            break
+
+
 def find_and_fill_loops(bm, boundary_edges, material_index, start_time, timeout, progress_callback=None):
     """
     Find all closed loops from boundary edges and fill them one at a time.
@@ -410,12 +548,13 @@ def find_and_fill_loops(bm, boundary_edges, material_index, start_time, timeout,
         progress_callback: optional function to call for progress updates
     
     Returns:
-        int: Number of faces created
+        tuple: (number of faces created, list of created faces)
     """
     if not boundary_edges:
-        return 0
+        return (0, [])
     
     faces_created = 0
+    created_faces = []
     processed_edges = set()
     boundary_edges_list = list(boundary_edges)
     loops_processed = 0
@@ -445,6 +584,7 @@ def find_and_fill_loops(bm, boundary_edges, material_index, start_time, timeout,
                     try:
                         face.material_index = material_index
                         faces_created += 1
+                        created_faces.append(face)
                     except (AttributeError, RuntimeError):
                         # Face might have been invalidated, skip it
                         pass
@@ -461,7 +601,7 @@ def find_and_fill_loops(bm, boundary_edges, material_index, start_time, timeout,
                 processed_edges.discard(e)
             continue
     
-    return faces_created
+    return (faces_created, created_faces)
 
 
 class PET_OT_fill_cut_faces(Operator):
@@ -476,13 +616,53 @@ class PET_OT_fill_cut_faces(Operator):
         default=True
     )
     
+    color_darkening_factor: FloatProperty(
+        name="Color Darkening",
+        description="Darken extracted material color to make fills less obvious (0.0-1.0). Lower values = darker fills",
+        default=0.65,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR'
+    )
+    
+    sample_depth: IntProperty(
+        name="Color Sample Depth",
+        description="Number of vertices to traverse inward from boundary when sampling color (avoids black borders)",
+        default=2,
+        min=1,
+        max=5
+    )
+    
     fallback_color: FloatVectorProperty(
         name="Fallback Color",
-        description="Color to use if material color cannot be extracted (gray/dark brown)",
-        default=(0.3, 0.3, 0.3),  # Medium gray - hidden inside model when reconnected
+        description="Color to use if material color cannot be extracted (dark brown/gray)",
+        default=(0.15, 0.1, 0.08),  # Dark brown - much less visible
         min=0.0,
         max=1.0,
         subtype='COLOR'
+    )
+    
+    auto_smooth_filled: BoolProperty(
+        name="Auto-Smooth Filled Faces",
+        description="Automatically smooth filled faces after creation for better integration",
+        default=True
+    )
+    
+    smooth_iterations: IntProperty(
+        name="Smooth Iterations",
+        description="Number of smoothing passes to apply to filled faces",
+        default=2,
+        min=1,
+        max=5
+    )
+    
+    smooth_factor: FloatProperty(
+        name="Smooth Factor",
+        description="Strength of smoothing per iteration (0.0-1.0)",
+        default=0.6,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR'
     )
     
     def execute(self, context):
@@ -545,19 +725,28 @@ class PET_OT_fill_cut_faces(Operator):
                         bpy.ops.object.mode_set(mode='OBJECT')
                         continue
                     
-                    # Get material color
+                    # Get material color - try adjacent face sampling first
                     fill_color = None
                     if self.use_material_color:
-                        fill_color = extract_primary_material_color(original_obj, obj)
+                        # First try sampling from adjacent faces (avoids black borders)
+                        fill_color = sample_color_from_adjacent_faces(bm, obj, boundary_edges, depth=self.sample_depth)
+                        
+                        # Fallback to general material extraction if adjacent sampling fails
+                        if not fill_color:
+                            fill_color = extract_primary_material_color(original_obj, obj)
+                        
+                        # Apply darkening factor to make fills less obvious
+                        if fill_color:
+                            fill_color = tuple(c * self.color_darkening_factor for c in fill_color[:3])
                     
                     # CRITICAL: Ensure fallback color is used if material detection fails
-                    # Default to gray (0.3, 0.3, 0.3) which is hidden inside model when reconnected
+                    # Default to dark brown (0.15, 0.1, 0.08) which is much less visible
                     if not fill_color:
-                        fill_color = tuple(self.fallback_color[:3]) if len(self.fallback_color) >= 3 else (0.3, 0.3, 0.3)
+                        fill_color = tuple(self.fallback_color[:3]) if len(self.fallback_color) >= 3 else (0.15, 0.1, 0.08)
                     
                     # Validate color values
                     if not all(0.0 <= c <= 1.0 for c in fill_color[:3]):
-                        fill_color = (0.3, 0.3, 0.3)  # Safe fallback to gray
+                        fill_color = (0.15, 0.1, 0.08)  # Safe fallback to dark brown
                     
                     # Create material for filled faces if needed
                     material = None
@@ -590,7 +779,7 @@ class PET_OT_fill_cut_faces(Operator):
                         # Progress is already updated per object, but we could add per-loop updates here
                         pass
                     
-                    faces_created = find_and_fill_loops(
+                    faces_created, created_faces = find_and_fill_loops(
                         bm,
                         boundary_edges,
                         material_index,
@@ -601,7 +790,21 @@ class PET_OT_fill_cut_faces(Operator):
                     
                     total_faces_created += faces_created
                     
+                    # Auto-smooth filled faces if enabled
+                    if self.auto_smooth_filled and created_faces:
+                        try:
+                            smooth_filled_faces(
+                                bm,
+                                created_faces,
+                                iterations=self.smooth_iterations,
+                                factor=self.smooth_factor
+                            )
+                        except (ValueError, RuntimeError) as e:
+                            # Smoothing failed, but continue with normal processing
+                            print(f"[Fill Cut Faces] Warning: Smoothing failed: {e}")
+                    
                     # Recalculate normals using bmesh ops (non-blocking)
+                    # Do this after smoothing to ensure proper normals
                     try:
                         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
                     except (ValueError, RuntimeError):

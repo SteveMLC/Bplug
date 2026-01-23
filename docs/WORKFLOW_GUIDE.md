@@ -40,6 +40,7 @@ When you import to Roblox Studio:
 **Methods**:
 
 #### Method A: Quick Segment (Edge Cuts) - Recommended
+
 1. Select mesh → **Quick Segment (Edge Cuts)** panel
 2. Enter **Edit Mode**, select edge loops around appendages
 3. Click segment buttons (Head, Legs, Tail, Wings) to mark each cut
@@ -47,17 +48,59 @@ When you import to Roblox Studio:
 5. Result: Vertex groups created (mesh still whole)
 
 #### Method B: Automatic Segmentation
+
 1. Select mesh → **Segmentation** panel
 2. Choose pet type (Quadruped/Biped/Flying)
 3. Click **"Segment Model"**
 4. Result: Vertex groups created automatically
 
 #### Method C: Manual Vertex Assignment
+
 1. Select mesh → **Manual Segment** panel
 2. Enter Edit Mode, manually select vertices for each part
 3. Click part buttons to assign
 4. Click **"Assign Remaining as Body"**
 5. Result: Vertex groups created manually
+
+#### Segmentation Button Functions
+
+**Preview Button** (Eye Icon):
+- **Purpose**: Preview segmentation results BEFORE finalizing or splitting
+- **What it does**:
+  - Creates vertex groups based on current settings
+  - Switches to **Weight Paint mode** automatically
+  - Selects the first vertex group for visualization
+  - Shows vertex groups in the Results section
+  - Does NOT split the mesh (non-destructive)
+- **How to use**:
+  1. Adjust settings (Pet Type, Detection Method, Sensitivity, etc.)
+  2. Click **"Preview"**
+  3. View results in Weight Paint mode
+  4. Switch between vertex groups in the Properties panel (Object Data → Vertex Groups) to see each part highlighted
+  5. Adjust settings and preview again if needed
+
+**Segment Model Button** (Gear Icon):
+- **Purpose**: Finalize segmentation and optionally auto-split
+- **What it does**:
+  - Creates vertex groups (same as Preview)
+  - Stores metrics (parts detected, vertex counts, processing time)
+  - If "Auto Split" is enabled: Automatically splits mesh into separate objects
+  - If "Auto Split" is disabled: Only creates vertex groups (recommended workflow)
+- **Recommended Settings**:
+  - ✅ **Auto Split: OFF** (default) - Preview first, then split manually when satisfied
+  - ✅ **Clear Existing Groups: ON** - Start fresh each time
+- **How to use**:
+  1. Preview first to check results
+  2. Adjust settings if needed
+  3. Click **"Segment Model"** to finalize
+  4. Review results in the Results section
+  5. Use "Split Manually" button when ready to split
+
+**Visualization Tips**:
+- In Weight Paint mode, each vertex group shows as a colored overlay
+- Switch vertex groups in Properties panel (Object Data Properties → Vertex Groups dropdown)
+- Red = selected vertex group, Blue = other groups
+- You can paint/adjust vertex groups directly in Weight Paint mode
 
 ### Step 2: Split Into Parts (CRITICAL: Pivot Calculation)
 
@@ -96,6 +139,8 @@ When you import to Roblox Studio:
 - Gaps are **workflow-only** (for filling/smoothing)
 - Pivot positions **NOT affected by gaps**
 - Stored positions used later for R6 joints
+
+**When to use**: After you've previewed and are satisfied with segmentation, when you're ready to work with separate parts, before rigging or exporting.
 
 ### Step 3: Clean Edges (Post-Split Cleanup)
 
@@ -341,6 +386,34 @@ When filling cuts, color is extracted in this order:
 - Check joint positions (should be at boundaries, not gaps)
 - Re-export R6 metadata and verify C0/C1 values
 
+### Segmentation Issues
+
+**"0 vertices" in Results**:
+- **Cause**: Vertex groups were created but no vertices assigned
+- **Solution**: 
+  - Check model orientation (might be rotated wrong)
+  - Try different Pet Type
+  - Adjust Sensitivity
+  - Try Spatial-Only mode if Geometry-Based fails
+
+**Preview shows wrong parts**:
+- **Cause**: Model doesn't match template assumptions
+- **Solution**:
+  - Try different Pet Type
+  - Adjust Sensitivity (lower = stricter boundaries)
+  - Manually adjust vertex groups in Weight Paint mode
+
+**Can't see vertex groups in Preview**:
+- **Solution**: 
+  - Make sure you're in Weight Paint mode
+  - Check Properties panel → Object Data → Vertex Groups
+  - Select a vertex group from the dropdown
+  - The selected group will be highlighted in red
+
+**Want to start over**:
+- Click "Clear Existing Groups" checkbox
+- Click Preview or Segment Model again
+
 ## Best Practices
 
 1. **Always use stored pivot positions** for R6 joints
@@ -349,6 +422,10 @@ When filling cuts, color is extracted in this order:
 4. **Use material color extraction** (better visual matching)
 5. **Verify pivot positions** visually before exporting
 6. **Test in Roblox Studio** before final export
+7. **Always preview first** before splitting
+8. **Keep Auto Split OFF** until you're satisfied
+9. **Use Weight Paint mode** to visualize and adjust
+10. **Check vertex counts** - empty groups (0 vertices) won't split properly
 
 ## Quick Reference
 

@@ -1,6 +1,6 @@
-# Quick Installation Guide - Pet Model Optimizer
+# Installation Guide - Pet Model Optimizer
 
-## 🚀 Quick Start (5 Minutes)
+## Quick Start (5 Minutes)
 
 ### Step 1: Find Your Blender Addons Folder
 
@@ -61,7 +61,7 @@ cd ~/.config/blender/<version>/scripts/addons/
    - "Workflow: Segment → Optimize → Rig → Export"
    - Multiple collapsible sections
 
-## ✅ Verification Checklist
+## Verification Checklist
 
 - [ ] Plugin folder copied to correct location
 - [ ] `__init__.py` exists in `blender_pet_optimizer/` folder
@@ -69,7 +69,7 @@ cd ~/.config/blender/<version>/scripts/addons/
 - [ ] No errors in Blender's console (Window → Toggle System Console)
 - [ ] "Pet Optimizer" tab visible in N-panel (press `N` in 3D Viewport)
 
-## 🎯 First Use - Test Run
+## First Use - Test Run
 
 1. **Create or import a test mesh**:
    - `File` → `Import` → Choose your format
@@ -87,7 +87,7 @@ cd ~/.config/blender/<version>/scripts/addons/
    - Click "Segment Model"
    - Check the Results box for parts detected
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 **Plugin not showing in Add-ons list?**
 - Check folder name is exactly `blender_pet_optimizer` (not `blender_pet_model_optimizer`)
@@ -109,20 +109,20 @@ cd ~/.config/blender/<version>/scripts/addons/
 - Make sure you have a mesh selected (not camera, light, or empty)
 - Click on the mesh in the 3D Viewport or Outliner
 
-## 📋 System Requirements
+## System Requirements
 
 - **Blender**: Version 3.0 or later
 - **Python**: Included with Blender (no separate installation needed)
 - **OS**: Windows, macOS, or Linux
 
-## 🎓 Next Steps
+## Next Steps
 
-Once installed, see the main [README.md](README.md) for:
-- Detailed usage guide
-- Complete workflow examples
-- Advanced features
-- Troubleshooting tips
+Once installed, see:
+- [README.md](../README.md) - Overview and quick start
+- [WORKFLOW_GUIDE.md](WORKFLOW_GUIDE.md) - Complete workflow examples
+- [FEATURE_REFERENCE.md](FEATURE_REFERENCE.md) - All features documented
+- [OPTIMIZATION.md](OPTIMIZATION.md) - Advanced optimization techniques
 
 ---
 
-**Ready to go!** Open Blender and start segmenting! 🚀
+**Ready to go!** Open Blender and start segmenting!

@@ -189,6 +189,12 @@ class PET_SplitSettings(PropertyGroup):
         description="Create pivot points at disconnect boundaries",
         default=True
     )
+    
+    strict_mode: BoolProperty(
+        name="Strict Mode",
+        description="Only include faces where ALL vertices are in the group (100% match)",
+        default=False
+    )
 
 
 class PET_ManualAssignmentState(PropertyGroup):
@@ -467,8 +473,10 @@ class PET_PT_mesh_optimization(Panel):
         try:
             if "pet_mesh_analysis_cache" in obj:
                 cached = obj.get("pet_mesh_analysis_cache", {})
-                if isinstance(cached, dict) and 'total_problems' in cached:
-                    problems = cached
+                # Use duck-typing: check for key existence, not dict type
+                # IDPropertyGroup from Blender doesn't pass isinstance(dict) check
+                if cached and 'total_problems' in cached:
+                    problems = dict(cached)  # Convert to dict to ensure consistent access
                     has_analysis = True
         except Exception as e:
             # Cache read failed - show error but don't crash UI
@@ -1096,6 +1104,39 @@ class PET_PT_split(Panel):
         
         layout.separator()
         
+        # ===== Clean Split Section =====
+        clean_box = layout.box()
+        clean_box.label(text="Clean Split (For Pre-Cleaned Meshes)", icon='CHECKMARK')
+        
+        # Help text explaining when to use clean split
+        help_col = clean_box.column(align=True)
+        help_col.scale_y = 0.8
+        help_col.label(text="Use when mesh has been cleaned and vertex")
+        help_col.label(text="groups precisely assigned. Strictly follows")
+        help_col.label(text="highlighted regions without expansion.")
+        
+        clean_box.separator()
+        
+        # Clean split button
+        clean_box.operator("pet.split_clean", text="Clean Split", icon='CHECKMARK')
+        
+        # Strict mode toggle - now from settings, not operator
+        row = clean_box.row()
+        row.prop(settings, "strict_mode", text="Strict Mode (100% vertex match)")
+        
+        clean_box.separator()
+        
+        # Comparison info
+        compare_col = clean_box.column(align=True)
+        compare_col.scale_y = 0.75
+        compare_col.label(text="Standard Split vs Clean Split:", icon='INFO')
+        compare_col.label(text="• Standard: Expands to fill gaps, includes")
+        compare_col.label(text="  adjacent geometry, uses spatial boundaries")
+        compare_col.label(text="• Clean: ONLY includes faces where vertices")
+        compare_col.label(text="  are assigned to the vertex group")
+        
+        layout.separator()
+        
         # ===== What Happens Info =====
         info_box = layout.box()
         info_box.label(text="What Happens When You Split:", icon='INFO')
@@ -1677,15 +1718,27 @@ class PET_PT_post_split_cleanup(Panel):
         else:
             fill_op = fill_box.operator("pet.fill_cut_faces", text="Fill Cut Faces", icon='FULLSCREEN_ENTER')
             fill_box.prop(fill_op, "use_material_color")
-            if not fill_op.use_material_color:
+            
+            if fill_op.use_material_color:
+                fill_box.prop(fill_op, "color_darkening_factor", slider=True)
+                fill_box.prop(fill_op, "sample_depth")
+            else:
                 fill_box.prop(fill_op, "fallback_color")
             
             fill_box.separator()
-            fill_box.label(text="Material Detection:", icon='INFO')
-            fill_box.label(text="1. Principled BSDF base color")
-            fill_box.label(text="2. Material diffuse color")
-            fill_box.label(text="3. Vertex colors (average)")
-            fill_box.label(text="4. Fallback color")
+            fill_box.prop(fill_op, "auto_smooth_filled")
+            
+            if fill_op.auto_smooth_filled:
+                fill_box.prop(fill_op, "smooth_iterations")
+                fill_box.prop(fill_op, "smooth_factor", slider=True)
+            
+            fill_box.separator()
+            fill_box.label(text="Color Detection:", icon='INFO')
+            fill_box.label(text="1. Adjacent faces (sample_depth)")
+            fill_box.label(text="2. Principled BSDF base color")
+            fill_box.label(text="3. Material diffuse color")
+            fill_box.label(text="4. Vertex colors (average)")
+            fill_box.label(text="5. Fallback color")
         
         layout.separator()
         

@@ -863,8 +863,8 @@ A: We use Blender's Decimate internally but add:
 ## Additional Resources
 
 - **Blender Decimate Modifier Docs**: https://docs.blender.org/manual/en/latest/modeling/modifiers/generate/decimate.html
-- **Complete Workflow Guide**: See `COMPLETE_WORKFLOW_GUIDE.md` for full pipeline
-- **Plugin Documentation**: See `PLUGIN_DOCUMENTATION.md` for all features
+- **Complete Workflow Guide**: See [WORKFLOW_GUIDE.md](WORKFLOW_GUIDE.md) for full pipeline
+- **Plugin Documentation**: See [FEATURE_REFERENCE.md](FEATURE_REFERENCE.md) for all features
 
 ---
 
