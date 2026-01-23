@@ -79,9 +79,16 @@ def get_cached_vertex_group_counts(obj):
                         break
             cached_counts[vg.name] = vert_count
         
-        # Store cache
-        obj[cache_key] = cached_counts
-        obj[cache_version_key] = mesh_hash
+        # Store cache - WRAP IN TRY/EXCEPT to handle "Writing to ID classes" error
+        # This can fail during UI drawing, but that's OK - we still return the calculated counts
+        try:
+            obj[cache_key] = cached_counts
+            obj[cache_version_key] = mesh_hash
+        except (AttributeError, RuntimeError, TypeError):
+            # Writing to object properties is not allowed during UI drawing
+            # This is fine - we'll just recalculate next time (performance hit, but functional)
+            # The calculated counts are still valid and returned
+            pass
     
     return cached_counts
 
@@ -149,6 +156,38 @@ class PET_SegmentationSettings(PropertyGroup):
         name="Invert Forward Axis",
         description="Manually invert the forward axis if auto-detection gets head/tail reversed. Use this if head is detected as tail and vice versa.",
         default=False
+    )
+
+
+class PET_SplitSettings(PropertyGroup):
+    """PropertyGroup for split settings stored on Scene"""
+    
+    keep_original: BoolProperty(
+        name="Keep Original Mesh",
+        description="Keep original mesh after splitting",
+        default=True
+    )
+    
+    verify_data: BoolProperty(
+        name="Verify Data Preservation",
+        description="Verify that UVs, colors, and materials are preserved",
+        default=True
+    )
+    
+    gap_distance: FloatProperty(
+        name="Gap Distance",
+        description="Distance to separate parts after splitting (for filling/smoothing workflow). Set to 0 to skip gap creation.",
+        default=0.1,
+        min=0.0,
+        max=10.0,
+        step=0.01,
+        precision=3
+    )
+    
+    create_pivots: BoolProperty(
+        name="Create Pivot Points",
+        description="Create pivot points at disconnect boundaries",
+        default=True
     )
 
 
@@ -237,130 +276,105 @@ class PET_ManualPartSelectionState(PropertyGroup):
     )
 
 
-class PET_LowPolySettings(PropertyGroup):
-    """PropertyGroup for low-poly prep settings stored on Scene"""
+class PET_PreOptimizationSettings(PropertyGroup):
+    """Settings for pre-segmentation mesh optimization"""
     
-    step_reduction: FloatProperty(
-        name="Step Reduction",
-        description="Gentle face reduction per step (0.005-0.20 for fine control)",
-        default=0.05,
-        min=0.005,
-        max=0.20,
-        subtype='PERCENTAGE',
-        precision=3,
+    # === CLEANING SETTINGS ===
+    merge_distance: FloatProperty(
+        name="Merge Distance",
+        description="Distance below which vertices are merged (in Blender units)",
+        default=0.0001,
+        min=0.00001,
+        max=0.01,
+        precision=5,
     )
     
-    algorithm: EnumProperty(
-        name="Algorithm",
-        description="Decimation algorithm for low-poly prep",
-        items=[
-            ('AUTO', "Auto", "Automatically select best algorithm based on mesh"),
-            ('QEM', "QEM Edge Collapse", "Quadric Error Metric edge collapse"),
-            ('CENTROID', "Centroid Clustering", "Centroid clustering decimation"),
-        ],
-        default='AUTO',
-    )
-    
-    preserve_sharp_features: BoolProperty(
-        name="Preserve Sharp Features",
-        description="Prefer to keep seams, creases, and borders when reducing polygons",
+    delete_loose: BoolProperty(
+        name="Delete Loose Geometry",
+        description="Remove vertices and edges not connected to any faces",
         default=True,
     )
     
-    max_faces: IntProperty(
-        name="Target Max Faces",
-        description="Optional target face count to stop at (0 = ignore)",
+    dissolve_degenerate: BoolProperty(
+        name="Dissolve Degenerate",
+        description="Remove zero-area faces and degenerate edges",
+        default=True,
+    )
+    
+    fix_non_manifold: BoolProperty(
+        name="Fix Non-Manifold Edges",
+        description="Remove duplicate faces causing non-manifold edges (edges shared by 3+ faces)",
+        default=True,
+    )
+    
+    # === REDUCTION SETTINGS ===
+    reduction_percent: FloatProperty(
+        name="Reduction Step",
+        description="Percentage of faces to remove per click (1-20%)",
+        default=5.0,
+        min=1.0,
+        max=20.0,
+        subtype='PERCENTAGE',
+        precision=1,
+    )
+    
+    use_auto_step: BoolProperty(
+        name="Auto Step Size",
+        description="Automatically calculate safe step size based on mesh complexity",
+        default=True,
+    )
+    
+    feature_angle: FloatProperty(
+        name="Feature Angle",
+        description="Angle threshold for detecting sharp edges (degrees)",
+        default=30.0,
+        min=15.0,
+        max=60.0,
+    )
+    
+    preserve_sharp: BoolProperty(
+        name="Preserve Sharp Edges",
+        description="Respect sharp edge marks during decimation",
+        default=True,
+    )
+    
+    preserve_seams: BoolProperty(
+        name="Preserve UV Seams",
+        description="Respect UV seam marks during decimation",
+        default=True,
+    )
+    
+    target_faces: IntProperty(
+        name="Target Faces",
+        description="Target face count for auto-reduce (0 = manual only)",
         default=0,
         min=0,
     )
 
 
-class PET_AdvancedOptimizerSettings(PropertyGroup):
-    """Advanced optimization settings for large meshes with corner preservation"""
+class PET_PostSplitOptimizationSettings(PropertyGroup):
+    """Settings for post-split part optimization"""
     
-    # Feature Detection
-    feature_angle: FloatProperty(
-        name="Feature Angle",
-        description="Angle threshold for detecting sharp features (degrees)",
-        default=math.radians(30.0),  # Store in radians (Blender ANGLE property requirement)
-        min=math.radians(15.0),
-        max=math.radians(60.0),
-        subtype='ANGLE',
-        unit='ROTATION'
-    )
-    
-    corner_threshold: IntProperty(
-        name="Corner Threshold",
-        description="Minimum feature edges incident to vertex to classify as corner",
-        default=2,
-        min=2,
-        max=4
-    )
-    
-    # Preservation Strength
-    corner_preservation_strength: FloatProperty(
-        name="Corner Preservation",
-        description="How strongly to protect corners (1.0 = absolute, 0.0 = none)",
-        default=0.8,
-        min=0.0,
-        max=1.0,
-        precision=2
-    )
-    
-    feature_edge_weight: FloatProperty(
-        name="Feature Edge Weight",
-        description="Penalty multiplier for feature edges (higher = more protected)",
-        default=10.0,
+    reduction_percent: FloatProperty(
+        name="Reduction Step",
+        description="Percentage of faces to remove per click (1-20%)",
+        default=5.0,
         min=1.0,
-        max=50.0
+        max=20.0,
+        subtype='PERCENTAGE',
+        precision=1,
     )
     
-    corner_weight: FloatProperty(
-        name="Corner Weight",
-        description="Penalty multiplier for corners (higher = more protected)",
-        default=50.0,
-        min=10.0,
-        max=200.0
+    preserve_boundaries: BoolProperty(
+        name="Preserve Boundaries",
+        description="Protect cut boundary edges from decimation",
+        default=True,
     )
     
-    # Detail vs Structure Control
-    detail_reduction_ratio: FloatProperty(
-        name="Detail Reduction",
-        description="How aggressively to reduce detail areas (0.0 = preserve all, 1.0 = maximum)",
-        default=0.7,
-        min=0.0,
-        max=1.0,
-        subtype='PERCENTAGE'
-    )
-    
-    # Large Mesh Performance
-    time_limit_per_chunk: FloatProperty(
-        name="Time Limit per Chunk",
-        description="Maximum seconds per processing chunk (prevents freezing)",
-        default=1.0,
-        min=0.5,
-        max=5.0,
-        precision=1
-    )
-    
-    batch_size: IntProperty(
-        name="Batch Size",
-        description="Number of edges/vertices to process per batch",
-        default=50000,
-        min=10000,
-        max=200000
-    )
-    
-    # Preset selection
-    preset: EnumProperty(
-        name="Preset",
-        items=[
-            ('CUSTOM', "Custom", "Use custom settings"),
-            ('CONSERVATIVE', "Conservative", "Preserve everything (max quality)"),
-            ('BALANCED', "Balanced", "Recommended for most cases"),
-            ('AGGRESSIVE', "Aggressive", "Maximum reduction"),
-        ],
-        default='BALANCED'
+    preserve_pivots: BoolProperty(
+        name="Preserve Pivots",
+        description="Avoid decimating near pivot points",
+        default=True,
     )
 
 
@@ -378,7 +392,7 @@ class PET_PT_main_panel(Panel):
 
 
 class PET_PT_mesh_optimization(Panel):
-    """Mesh optimization panel"""
+    """Pre-segmentation mesh optimization panel"""
     bl_label = "Mesh Optimization"
     bl_idname = "PET_PT_mesh_optimization"
     bl_space_type = 'VIEW_3D'
@@ -390,179 +404,274 @@ class PET_PT_mesh_optimization(Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        
-        # Object selector
-        row = layout.row()
-        row.label(text="Object:")
-        row.prop(context, "active_object", text="")
-        
         obj = context.active_object
+        
         if not obj or obj.type != 'MESH':
             layout.label(text="Select a mesh object", icon='INFO')
             return
         
-        # Face count info
-        face_count = len(obj.data.polygons) if obj.data.polygons else 0
-        layout.label(text=f"Faces: {face_count:,}", icon='MESH_DATA')
+        # Get settings (always available after registration)
+        settings = scene.pet_pre_optimization_settings
         
-        # Low-Poly Prep (pre-segmentation gentle decimation)
-        lowpoly_settings = getattr(scene, "pet_lowpoly_settings", None)
-        if lowpoly_settings:
-            lp_box = layout.box()
-            lp_box.label(text="Low-Poly Prep (Before Segmentation)", icon='MOD_DECIM')
-            
-            # Show cumulative stats if available
-            initial_faces = obj.get("pet_lowpoly_initial_faces", 0)
-            last_faces = obj.get("pet_lowpoly_last_faces", 0)
-            total_reduction = obj.get("pet_lowpoly_total_reduction", 0.0)
-            
-            if initial_faces and last_faces:
-                lp_box.label(
-                    text=f"From {initial_faces:,} to {last_faces:,} faces "
-                         f"({total_reduction * 100.0:.1f}% total reduction)",
-                    icon='INFO',
-                )
-            else:
-                lp_box.label(text="Use gentle steps before cutting/splitting.", icon='INFO')
-            
-            # Settings
-            lp_box.prop(lowpoly_settings, "step_reduction", slider=True)
-            lp_box.prop(lowpoly_settings, "algorithm")
-            lp_box.prop(lowpoly_settings, "preserve_sharp_features")
-            lp_box.prop(lowpoly_settings, "max_faces")
-            
-            # Actions
-            row = lp_box.row(align=True)
-            row.scale_y = 1.2
-            preview_op = row.operator(
-                "pet.lowpoly_prep",
-                text="Preview Low-Poly",
-                icon='HIDE_OFF',
-            )
-            preview_op.mode = 'PREVIEW'
-            
-            apply_op = row.operator(
-                "pet.lowpoly_prep",
-                text="Apply Step",
-                icon='CHECKMARK',
-            )
-            apply_op.mode = 'APPLY'
-            
-            lp_box.label(
-                text="⚠️ For large meshes (500K+), use 'Iterative Optimize' below for better control",
-                icon='ERROR'
-            )
-            lp_box.label(
-                text="Start with VERY small steps (1-5%), preview, then iterate.",
-                icon='INFO',
-            )
-            lp_box.label(
-                text="Recommended: 1-3% for 500K+ faces, 5-10% for smaller meshes",
-                icon='INFO',
-            )
-            
-            layout.separator()
+        # =================================================================
+        # MESH INFO SECTION
+        # =================================================================
+        info_box = layout.box()
+        info_box.label(text="Mesh Information", icon='MESH_DATA')
         
-        # Advanced Optimization Section (Large Meshes)
-        adv_box = layout.box()
-        adv_box.label(text="Advanced Optimization (Large Meshes)", icon='MODIFIER_DATA')
+        mesh = obj.data
+        vert_count = len(mesh.vertices)
+        face_count = len(mesh.polygons)
         
-        settings = getattr(scene, "pet_advanced_optimizer_settings", None)
-        if not settings:
-            adv_box.label(text="Settings not available", icon='ERROR')
-        else:
-            # Preset selector
-            adv_box.prop(settings, "preset", expand=True)
-            
-            # Vertex/Face count info with warnings
-            vert_count = len(obj.data.vertices) if obj.data.vertices else 0
-            face_count = len(obj.data.polygons) if obj.data.polygons else 0
-            
-            info_row = adv_box.row()
-            info_row.label(text=f"Vertices: {vert_count:,}", icon='VERTEXSEL')
-            info_row.label(text=f"Faces: {face_count:,}", icon='FACESEL')
-            
-            # Show warning for large meshes
-            if vert_count > 300000:
-                adv_box.label(
-                    text="⚠ Large mesh detected - using optimized settings",
-                    icon='ERROR'
-                )
-                adv_box.label(
-                    text="Step size auto-adjusted to 1-2% for very large meshes",
-                    icon='INFO'
-                )
-            
-            # Feature Detection Settings
-            feature_box = adv_box.box()
-            feature_box.label(text="Feature Detection", icon='SNAP_MIDPOINT')
-            feature_box.prop(settings, "feature_angle")
-            feature_box.prop(settings, "corner_threshold")
-            
-            # Preservation Settings
-            preserve_box = adv_box.box()
-            preserve_box.label(text="Preservation Strength", icon='LOCKED')
-            preserve_box.prop(settings, "corner_preservation_strength", slider=True)
-            preserve_box.prop(settings, "feature_edge_weight")
-            preserve_box.prop(settings, "corner_weight")
-            
-            # Detail Control
-            detail_box = adv_box.box()
-            detail_box.label(text="Detail Reduction", icon='BRUSH_DATA')
-            detail_box.prop(settings, "detail_reduction_ratio", slider=True)
-            detail_box.label(
-                text="Note: Detail reduction implementation coming in Phase 4",
-                icon='INFO'
+        row = info_box.row()
+        row.label(text=f"Vertices: {vert_count:,}")
+        row.label(text=f"Faces: {face_count:,}")
+        
+        # Show optimization progress if available
+        from ..utils import algorithms
+        try:
+            stats = algorithms.get_optimization_stats(obj)
+        except:
+            stats = {}
+        
+        if stats.get('has_history', False):
+            progress_box = info_box.box()
+            progress_box.label(text="Optimization Progress", icon='TIME')
+            progress_box.label(
+                text=f"Original: {stats['initial_faces']:,} faces"
             )
-            
-            # Performance Settings
-            perf_box = adv_box.box()
-            perf_header = perf_box.row()
-            perf_header.prop(settings, "time_limit_per_chunk")
-            perf_header.prop(settings, "batch_size")
-            
-            # Iterative Optimization Operator
-            adv_box.separator()
-            adv_box.label(
-                text="⚠️ RECOMMENDED: Use Iterative Optimize for precise control",
-                icon='INFO'
+            progress_box.label(
+                text=f"Current: {stats['current_faces']:,} faces "
+                     f"({stats['face_reduction_percent']:.1f}% reduced)"
             )
-            adv_box.label(
-                text="Automatically uses small steps (3-5% for large meshes)",
-                icon='INFO'
-            )
-            iter_op = adv_box.operator(
-                "pet.iterative_optimize",
-                text="Iterative Optimize (Recommended)",
-                icon='FORWARD'
-            )
-            
-            # Show current reduction stats if available
-            initial_faces = obj.get("pet_advanced_initial_faces", 0)
-            current_faces = len(obj.data.polygons) if obj.data.polygons else 0
-            if initial_faces > 0:
-                reduction_pct = (1.0 - (current_faces / initial_faces)) * 100.0
-                adv_box.label(
-                    text=f"Progress: {initial_faces:,} → {current_faces:,} ({reduction_pct:.1f}%)",
-                    icon='INFO'
-                )
+            progress_box.label(text=f"Steps taken: {stats['step_count']}")
+        
+        # Recommended step size
+        recommended, explanation = algorithms.get_recommended_step_size(obj)
+        info_box.label(text=explanation, icon='INFO')
         
         layout.separator()
         
-        # Legacy Advanced optimizer (more aggressive / manual control)
-        layout.label(text="Legacy Optimization", icon='MODIFIER')
-        op = layout.operator("pet.optimize_mesh", text="Optimize Mesh")
+        # =================================================================
+        # MESH CLEANING SECTION (First Step!)
+        # =================================================================
+        clean_box = layout.box()
+        clean_box.label(text="Step 1: Mesh Cleaning", icon='BRUSH_DATA')
+        clean_box.label(text="Fix geometry issues before decimation", icon='INFO')
         
-        col = layout.column()
-        col.prop(op, "algorithm", expand=True)
+        # Check if we have cached analysis results (with error handling)
+        # Read cache directly instead of calling function (INSTANT - no function call)
+        has_analysis = False
+        problems = None
         
-        # Reduction slider
-        layout.prop(op, "reduction", slider=True)
-        layout.prop(op, "preserve_sharp_features")
+        try:
+            if "pet_mesh_analysis_cache" in obj:
+                cached = obj.get("pet_mesh_analysis_cache", {})
+                if isinstance(cached, dict) and 'total_problems' in cached:
+                    problems = cached
+                    has_analysis = True
+        except Exception as e:
+            # Cache read failed - show error but don't crash UI
+            clean_box.label(text=f"Cache error: {str(e)[:50]}", icon='ERROR')
+            has_analysis = False
+            problems = None
         
-        # Grid size (only for centroid clustering)
-        if op.algorithm in ['AUTO', 'CENTROID']:
-            layout.prop(op, "grid_size")
+        if has_analysis and problems:
+            try:
+                if problems.get('total_problems', 0) > 0:
+                    # Show problem counts in warning style
+                    problem_col = clean_box.column(align=True)
+                    problem_col.alert = True
+                    
+                    row1 = problem_col.row()
+                    row1.label(text=f"Loose verts: {problems.get('loose_verts', 0):,}")
+                    row1.label(text=f"Loose edges: {problems.get('loose_edges', 0):,}")
+                    
+                    row2 = problem_col.row()
+                    row2.label(text=f"Degenerate: {problems.get('degenerate_faces', 0):,}")
+                    row2.label(text=f"Non-manifold: {problems.get('non_manifold_edges', 0):,}")
+                    
+                    clean_box.label(
+                        text=f"Total: {problems.get('total_problems', 0):,} issues found!",
+                        icon='ERROR'
+                    )
+                else:
+                    # Check if already cleaned
+                    try:
+                        if obj.get("pet_last_cleaned", False):
+                            clean_box.label(text="Mesh is clean", icon='CHECKMARK')
+                        else:
+                            clean_box.label(text="No obvious issues detected", icon='CHECKMARK')
+                    except:
+                        clean_box.label(text="No obvious issues detected", icon='CHECKMARK')
+            except Exception as e:
+                # Error displaying results - show fallback
+                clean_box.label(text="Error displaying results", icon='ERROR')
+                clean_box.label(text="Click 'Analyze' to re-check", icon='INFO')
+        else:
+            # No analysis yet - show info message
+            clean_box.label(text="Click 'Analyze' to check for issues", icon='INFO')
+        
+        # Cleaning settings
+        settings_col = clean_box.column(align=True)
+        try:
+            settings_col.prop(settings, "merge_distance")
+            settings_col.prop(settings, "delete_loose")
+            settings_col.prop(settings, "dissolve_degenerate")
+        except Exception as e:
+            # Settings property missing - show error but don't crash
+            clean_box.label(text=f"Settings error: {str(e)[:50]}", icon='ERROR')
+            clean_box.label(text="Try reloading the addon", icon='INFO')
+        
+        # Buttons row
+        button_row = clean_box.row(align=True)
+        
+        # Analyze button
+        try:
+            analyze_op = button_row.operator(
+                "pet.analyze_mesh",
+                text="Analyze",
+                icon='VIEWZOOM'
+            )
+        except Exception as e:
+            clean_box.label(text=f"Error creating Analyze button: {str(e)[:50]}", icon='ERROR')
+        
+        # Clean button
+        try:
+            if has_analysis and problems:
+                total = problems.get('total_problems', 0)
+                clean_text = "Clean Mesh" if total == 0 else f"Clean ({total} issues)"
+            else:
+                # Try to get from cache if available
+                try:
+                    cached = obj.get("pet_mesh_analysis_cache", {})
+                    total = cached.get('total_problems', 0) if isinstance(cached, dict) else 0
+                    clean_text = "Clean Mesh" if total == 0 else f"Clean ({total} issues)"
+                except:
+                    clean_text = "Clean Mesh"
+            
+            clean_op = button_row.operator(
+                "pet.clean_mesh",
+                text=clean_text,
+                icon='BRUSH_DATA'
+            )
+            # Safely get settings values with defaults
+            try:
+                clean_op.merge_distance = getattr(settings, "merge_distance", 0.0001)
+                clean_op.delete_loose = getattr(settings, "delete_loose", True)
+                clean_op.dissolve_degenerate = getattr(settings, "dissolve_degenerate", True)
+                clean_op.fix_non_manifold = getattr(settings, "fix_non_manifold", True)
+            except Exception as e:
+                # If settings access fails, use operator defaults
+                clean_op.merge_distance = 0.0001
+                clean_op.delete_loose = True
+                clean_op.dissolve_degenerate = True
+        except Exception as e:
+            clean_box.label(text=f"Error creating Clean button: {str(e)[:50]}", icon='ERROR')
+        
+        layout.separator()
+        
+        # =================================================================
+        # FEATURE DETECTION SECTION
+        # =================================================================
+        feature_box = layout.box()
+        feature_box.label(text="Step 2: Feature Detection", icon='SNAP_MIDPOINT')
+        feature_box.label(text="Detect sharp edges to protect during reduction")
+        
+        feature_box.prop(settings, "feature_angle", text="Angle Threshold")
+        
+        # Feature counts (use cache for performance)
+        edge_counts = algorithms.count_feature_edges(obj, use_cache=True)
+        if edge_counts['sharp'] > 0 or edge_counts['boundary'] > 0:
+            count_row = feature_box.row()
+            count_row.label(text=f"Sharp: {edge_counts['sharp']:,}")
+            count_row.label(text=f"Boundary: {edge_counts['boundary']:,}")
+        
+        # Show marked count after detection
+        marked_count = obj.get("pet_feature_edges_marked", 0)
+        if marked_count > 0:
+            feature_box.label(text=f"Last detection marked: {marked_count:,} edges", icon='CHECKMARK')
+        
+        # Detect/Clear buttons
+        detect_row = feature_box.row(align=True)
+        detect_op = detect_row.operator("pet.detect_features", text="Detect Features", icon='VIEWZOOM')
+        detect_op.angle_threshold = settings.feature_angle
+        
+        detect_row.operator("pet.clear_feature_marks", text="Clear", icon='X')
+        
+        layout.separator()
+        
+        # =================================================================
+        # ITERATIVE REDUCTION SECTION
+        # =================================================================
+        reduce_box = layout.box()
+        reduce_box.label(text="Step 3: Iterative Reduction", icon='MOD_DECIM')
+        reduce_box.label(text="Click repeatedly to reduce mesh in controlled steps")
+        
+        reduce_box.prop(settings, "reduction_percent", slider=True)
+        reduce_box.prop(settings, "use_auto_step")
+        
+        col = reduce_box.column(align=True)
+        col.prop(settings, "preserve_sharp")
+        col.prop(settings, "preserve_seams")
+        
+        # Calculate expected reduction for display
+        if settings.use_auto_step:
+            expected_ratio = recommended
+        else:
+            expected_ratio = settings.reduction_percent / 100.0
+        expected_verts = int(vert_count * expected_ratio)
+        reduce_box.label(
+            text=f"Will remove ~{expected_verts:,} vertices per step",
+            icon='INFO'
+        )
+        
+        # Main reduce button
+        reduce_row = reduce_box.row()
+        reduce_row.scale_y = 1.5
+        reduce_op = reduce_row.operator(
+            "pet.decimate_step",
+            text=f"Reduce by {settings.reduction_percent:.0f}%",
+            icon='PLAY'
+        )
+        reduce_op.reduction_percent = settings.reduction_percent
+        reduce_op.use_auto_step = settings.use_auto_step
+        reduce_op.preserve_sharp = settings.preserve_sharp
+        reduce_op.preserve_seams = settings.preserve_seams
+        
+        layout.separator()
+        
+        # =================================================================
+        # TARGET-BASED REDUCTION SECTION
+        # =================================================================
+        target_box = layout.box()
+        target_box.label(text="Target-Based Reduction", icon='DRIVER_DISTANCE')
+        target_box.label(text="Automatically reduce to target face count (multi-step)")
+        target_box.label(text="This will run multiple iterations automatically", icon='INFO')
+        
+        target_box.prop(settings, "target_faces", text="Target Faces")
+        
+        target_row = target_box.row()
+        target_row.scale_y = 1.2
+        target_op = target_row.operator(
+            "pet.decimate_to_target",
+            text="Auto-Reduce to Target",
+            icon='FORWARD'
+        )
+        if settings.target_faces > 0:
+            target_op.target_faces = settings.target_faces
+        target_op.preserve_sharp = settings.preserve_sharp
+        
+        layout.separator()
+        
+        # =================================================================
+        # RESET SECTION
+        # =================================================================
+        reset_row = layout.row(align=True)
+        reset_row.operator("pet.reset_optimization", text="Reset Stats", icon='FILE_REFRESH')
+        
+        # Undo hint
+        layout.label(text="Use Ctrl+Z to undo reduction steps", icon='LOOP_BACK')
 
 
 class PET_PT_segmentation(Panel):
@@ -962,54 +1071,28 @@ class PET_PT_split(Panel):
         
         split_box.separator()
         
-        # ALWAYS create the split button first - guaranteed to be visible
-        # This ensures the button is always accessible even if property access fails
-        split_op = split_box.operator("pet.split_by_vertex_groups", text="Split Into Parts", icon='MODIFIER_ON')
+        # Get settings from scene properties
+        settings = context.scene.pet_split_settings
+        
+        # Display all properties using PropertyGroup (this works!)
+        split_box.prop(settings, "keep_original", text="Keep Original Mesh")
+        split_box.prop(settings, "verify_data", text="Verify Data Preservation")
         
         split_box.separator()
         
-        # Display properties with robust error handling
-        # Each property has a fallback to ensure UI always shows something
-        # Keep Original Mesh checkbox
-        try:
-            split_box.prop(split_op, "keep_original", text="Keep Original Mesh")
-        except (AttributeError, TypeError, RuntimeError) as e:
-            # Fallback: show label with default value, but button still works
-            split_box.label(text="✓ Keep Original Mesh (default: ON)", icon='CHECKMARK')
-            print(f"Warning: Could not display keep_original property: {e}")
-        
-        # Verify Data Preservation checkbox
-        try:
-            split_box.prop(split_op, "verify_data", text="Verify Data Preservation")
-        except (AttributeError, TypeError, RuntimeError) as e:
-            # Fallback: show label with default value
-            split_box.label(text="✓ Verify Data Preservation (default: ON)", icon='CHECKMARK')
-            print(f"Warning: Could not display verify_data property: {e}")
-        
-        split_box.separator()
-        
-        # Gap Distance slider
-        try:
-            split_box.prop(split_op, "gap_distance", slider=True)
-        except (AttributeError, TypeError, RuntimeError) as e:
-            # Fallback: show label with default value
-            split_box.label(text="Gap Distance: 0.100 (default)", icon='INFO')
-            print(f"Warning: Could not display gap_distance property: {e}")
-        
+        split_box.prop(settings, "gap_distance", slider=True)
         split_box.label(text="Gap: Creates space between parts for workflow", icon='INFO')
         split_box.label(text="(Makes cut edges accessible for smoothing/filling)")
         
         split_box.separator()
         
-        # Create Pivot Points checkbox
-        try:
-            split_box.prop(split_op, "create_pivots", text="Create Pivot Points")
-        except (AttributeError, TypeError, RuntimeError) as e:
-            # Fallback: show label with default value
-            split_box.label(text="✓ Create Pivot Points (default: ON)", icon='CHECKMARK')
-            print(f"Warning: Could not display create_pivots property: {e}")
-        
+        split_box.prop(settings, "create_pivots", text="Create Pivot Points")
         split_box.label(text="⚠️ Pivots calculated BEFORE gaps (for R6 joints)", icon='ERROR')
+        
+        split_box.separator()
+        
+        # Split button - operator will read from scene settings
+        split_op = split_box.operator("pet.split_by_vertex_groups", text="Split Into Parts", icon='MODIFIER_ON')
         
         layout.separator()
         
@@ -1394,6 +1477,154 @@ class PET_PT_r6_joints(Panel):
             info_box.label(text="(calculated BEFORE gaps were created)", icon='INFO')
 
 
+class PET_PT_post_split_optimization(Panel):
+    """Post-split mesh optimization panel for reducing split parts"""
+    bl_label = "Post-Split Optimization"
+    bl_idname = "PET_PT_post_split_optimization"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pet Optimizer"
+    bl_parent_id = "PET_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        # Get selected mesh parts
+        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        
+        if not selected_meshes:
+            layout.label(text="Select split part objects", icon='INFO')
+            layout.label(text="(Objects created from splitting)")
+            return
+        
+        # Get settings (always available after registration)
+        settings = scene.pet_post_split_optimization_settings
+        
+        # =================================================================
+        # SELECTED PARTS INFO
+        # =================================================================
+        info_box = layout.box()
+        info_box.label(text=f"Selected Parts: {len(selected_meshes)}", icon='MESH_DATA')
+        
+        total_faces = 0
+        total_verts = 0
+        
+        # Show per-part info (limit to 6 to avoid UI clutter)
+        parts_col = info_box.column(align=True)
+        for i, obj in enumerate(selected_meshes[:6]):
+            faces = len(obj.data.polygons)
+            verts = len(obj.data.vertices)
+            total_faces += faces
+            total_verts += verts
+            
+            # Check for boundary protection
+            boundaries = obj.get("pet_boundary_edges_protected", 0)
+            boundary_text = f" ({boundaries} edges protected)" if boundaries > 0 else ""
+            
+            parts_col.label(text=f"  {obj.name}: {faces:,} faces{boundary_text}")
+        
+        if len(selected_meshes) > 6:
+            parts_col.label(text=f"  ... and {len(selected_meshes) - 6} more")
+            for obj in selected_meshes[6:]:
+                total_faces += len(obj.data.polygons)
+                total_verts += len(obj.data.vertices)
+        
+        info_box.label(text=f"Total: {total_verts:,} vertices, {total_faces:,} faces")
+        
+        layout.separator()
+        
+        # =================================================================
+        # BOUNDARY PROTECTION SECTION
+        # =================================================================
+        boundary_box = layout.box()
+        boundary_box.label(text="Boundary Protection", icon='LOCKED')
+        boundary_box.label(text="Protect cut edges from decimation")
+        
+        boundary_box.prop(settings, "preserve_boundaries")
+        boundary_box.prop(settings, "preserve_pivots")
+        
+        # Protect boundaries button
+        protect_row = boundary_box.row()
+        protect_row.operator("pet.protect_boundaries", text="Mark Boundaries", icon='EDGESEL')
+        
+        # Show boundary counts
+        from ..utils import algorithms
+        total_boundaries = 0
+        for obj in selected_meshes:
+            counts = algorithms.count_feature_edges(obj)
+            total_boundaries += counts.get('boundary', 0)
+        
+        if total_boundaries > 0:
+            boundary_box.label(text=f"Total boundary edges: {total_boundaries:,}", icon='INFO')
+        
+        layout.separator()
+        
+        # =================================================================
+        # PER-PART REDUCTION SECTION
+        # =================================================================
+        reduce_box = layout.box()
+        reduce_box.label(text="Per-Part Reduction", icon='MOD_DECIM')
+        reduce_box.label(text="Reduce all selected parts while preserving boundaries")
+        
+        reduce_box.prop(settings, "reduction_percent", slider=True)
+        
+        # Calculate expected reduction
+        expected_ratio = settings.reduction_percent / 100.0
+        expected_faces = int(total_faces * expected_ratio)
+        reduce_box.label(
+            text=f"Will remove ~{expected_faces:,} faces total",
+            icon='INFO'
+        )
+        
+        # Main reduce button
+        reduce_row = reduce_box.row()
+        reduce_row.scale_y = 1.5
+        reduce_op = reduce_row.operator(
+            "pet.optimize_selected_parts",
+            text=f"Reduce All by {settings.reduction_percent:.0f}%",
+            icon='PLAY'
+        )
+        reduce_op.reduction_percent = settings.reduction_percent
+        reduce_op.preserve_boundaries = settings.preserve_boundaries
+        
+        layout.separator()
+        
+        # =================================================================
+        # SINGLE PART REDUCTION
+        # =================================================================
+        single_box = layout.box()
+        single_box.label(text="Single Part Reduction", icon='OBJECT_DATA')
+        
+        obj = context.active_object
+        if obj and obj.type == 'MESH':
+            single_box.label(text=f"Active: {obj.name}", icon='RESTRICT_SELECT_OFF')
+            
+            single_op = single_box.operator(
+                "pet.optimize_part",
+                text=f"Reduce {obj.name}",
+                icon='PLAY'
+            )
+            single_op.reduction_percent = settings.reduction_percent
+            single_op.preserve_boundaries = settings.preserve_boundaries
+        else:
+            single_box.label(text="No active mesh object", icon='INFO')
+        
+        layout.separator()
+        
+        # =================================================================
+        # WORKFLOW GUIDANCE
+        # =================================================================
+        workflow_box = layout.box()
+        workflow_box.label(text="Workflow", icon='INFO')
+        workflow_box.label(text="1. Select split parts to optimize")
+        workflow_box.label(text="2. Click 'Mark Boundaries' to protect cut edges")
+        workflow_box.label(text="3. Adjust reduction percentage (3-5% recommended)")
+        workflow_box.label(text="4. Click 'Reduce All' - repeat as needed")
+        workflow_box.label(text="5. Use Ctrl+Z to undo if over-reduced")
+
+
 class PET_PT_post_split_cleanup(Panel):
     """Post-split cleanup panel for edge smoothing and cut filling"""
     bl_label = "Post-Split Cleanup"
@@ -1458,14 +1689,28 @@ class PET_PT_post_split_cleanup(Panel):
         
         layout.separator()
         
+        # Gap Creation Section
+        gap_box = layout.box()
+        gap_box.label(text="Gap Creation", icon='ARROW_LEFTRIGHT')
+        gap_box.label(text="Create gaps between split parts for visual review")
+        
+        if context.mode != 'OBJECT':
+            gap_box.label(text="Switch to Object Mode", icon='INFO')
+        else:
+            gap_op = gap_box.operator("pet.create_gaps", text="Create Gaps", icon='ARROW_LEFTRIGHT')
+            gap_box.prop(gap_op, "gap_distance")
+        
+        layout.separator()
+        
         # Workflow Guidance
         workflow_box = layout.box()
         workflow_box.label(text="Workflow Order", icon='SORTALPHA')
-        workflow_box.label(text="1. Split model (creates gaps)")
-        workflow_box.label(text="2. Clean edges (smooth cut boundaries)")
-        workflow_box.label(text="3. Fill cuts (cap open surfaces)")
-        workflow_box.label(text="4. Create R6 joints (uses stored pivots)")
-        workflow_box.label(text="5. Export to Roblox")
+        workflow_box.label(text="1. Split model")
+        workflow_box.label(text="2. Create gaps (optional, for visual review)")
+        workflow_box.label(text="3. Clean edges (smooth cut boundaries)")
+        workflow_box.label(text="4. Fill cuts (cap open surfaces)")
+        workflow_box.label(text="5. Create R6 joints (uses stored pivots)")
+        workflow_box.label(text="6. Export to Roblox")
         
         workflow_box.separator()
         workflow_box.label(text="⚠️ Gaps are workflow-only", icon='ERROR')
@@ -1646,6 +1891,7 @@ class PET_PT_manual_part_selection(Panel):
                 current_box.label(text="Adjust Selection:", icon='MODIFIER')
                 
                 edit_row = current_box.row(align=True)
+                edit_row.operator("pet.grow_selection_boundary_aware", text="Grow")
                 edit_row.operator("pet.grow_selection", text="Grow +")
                 edit_row.operator("pet.shrink_selection", text="Shrink -")
                 
@@ -1895,12 +2141,15 @@ class PET_PT_symmetry(Panel):
 
 
 classes = [
+    # Property Groups (must be registered before panels that use them)
     PET_SegmentationSettings,
     PET_ManualAssignmentState,
     PET_SymmetrySettings,
     PET_ManualPartSelectionState,
-    PET_LowPolySettings,
-    PET_AdvancedOptimizerSettings,
+    PET_PreOptimizationSettings,
+    PET_PostSplitOptimizationSettings,
+    PET_SplitSettings,
+    # Panels
     PET_PT_main_panel,
     PET_PT_mesh_optimization,
     PET_PT_segmentation,
@@ -1912,6 +2161,7 @@ classes = [
     PET_PT_r6_joints,
     PET_PT_standardization,
     PET_PT_export,
+    PET_PT_post_split_optimization,
     PET_PT_post_split_cleanup,
     PET_PT_batch_operations,
 ]
@@ -1920,14 +2170,17 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     
+    # Register Scene properties
     bpy.types.Scene.pet_segmentation_settings = bpy.props.PointerProperty(type=PET_SegmentationSettings)
     bpy.types.Scene.pet_manual_assignment_state = bpy.props.PointerProperty(type=PET_ManualAssignmentState)
     bpy.types.Scene.pet_symmetry_settings = bpy.props.PointerProperty(type=PET_SymmetrySettings)
     bpy.types.Scene.pet_manual_part_selection_state = bpy.props.PointerProperty(type=PET_ManualPartSelectionState)
-    bpy.types.Scene.pet_lowpoly_settings = bpy.props.PointerProperty(type=PET_LowPolySettings)
-    bpy.types.Scene.pet_advanced_optimizer_settings = bpy.props.PointerProperty(type=PET_AdvancedOptimizerSettings)
+    bpy.types.Scene.pet_pre_optimization_settings = bpy.props.PointerProperty(type=PET_PreOptimizationSettings)
+    bpy.types.Scene.pet_post_split_optimization_settings = bpy.props.PointerProperty(type=PET_PostSplitOptimizationSettings)
+    bpy.types.Scene.pet_split_settings = bpy.props.PointerProperty(type=PET_SplitSettings)
 
 def unregister():
+    # Unregister Scene properties
     if hasattr(bpy.types.Scene, 'pet_segmentation_settings'):
         del bpy.types.Scene.pet_segmentation_settings
     if hasattr(bpy.types.Scene, 'pet_manual_assignment_state'):
@@ -1936,10 +2189,12 @@ def unregister():
         del bpy.types.Scene.pet_symmetry_settings
     if hasattr(bpy.types.Scene, 'pet_manual_part_selection_state'):
         del bpy.types.Scene.pet_manual_part_selection_state
-    if hasattr(bpy.types.Scene, 'pet_lowpoly_settings'):
-        del bpy.types.Scene.pet_lowpoly_settings
-    if hasattr(bpy.types.Scene, 'pet_advanced_optimizer_settings'):
-        del bpy.types.Scene.pet_advanced_optimizer_settings
+    if hasattr(bpy.types.Scene, 'pet_pre_optimization_settings'):
+        del bpy.types.Scene.pet_pre_optimization_settings
+    if hasattr(bpy.types.Scene, 'pet_post_split_optimization_settings'):
+        del bpy.types.Scene.pet_post_split_optimization_settings
+    if hasattr(bpy.types.Scene, 'pet_split_settings'):
+        del bpy.types.Scene.pet_split_settings
     
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

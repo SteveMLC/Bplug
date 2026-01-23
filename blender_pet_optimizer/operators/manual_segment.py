@@ -8,6 +8,82 @@ from ..utils.spatial_selection import fill_gaps_aggressive
 
 
 MAX_VERTS_DIRECT = 100000
+
+
+def build_spatial_index(stored_boundaries, tolerance=0.001):
+    """
+    Build a spatial index from stored boundary coordinates for O(n) lookup.
+    
+    Args:
+        stored_boundaries: List of [[v1_co, v2_co], ...] coordinate pairs
+        tolerance: Distance tolerance for coordinate matching
+    
+    Returns:
+        dict: Spatial index mapping rounded coordinate tuples to sets of exact coordinates
+    """
+    spatial_index = {}
+    
+    for boundary_pair in stored_boundaries:
+        if len(boundary_pair) != 2:
+            continue
+        
+        v1_co = boundary_pair[0]
+        v2_co = boundary_pair[1]
+        
+        for co in [v1_co, v2_co]:
+            if len(co) < 3:
+                continue
+            # Create a key based on rounded coordinates
+            key = (
+                round(co[0] / tolerance),
+                round(co[1] / tolerance),
+                round(co[2] / tolerance)
+            )
+            if key not in spatial_index:
+                spatial_index[key] = set()
+            spatial_index[key].add((co[0], co[1], co[2]))
+    
+    return spatial_index
+
+
+def coord_in_spatial_index(co, spatial_index, tolerance=0.001):
+    """
+    Check if a coordinate is in the spatial index (within tolerance).
+    
+    Args:
+        co: Coordinate to check (Vector or tuple)
+        spatial_index: Spatial index from build_spatial_index()
+        tolerance: Distance tolerance for matching
+    
+    Returns:
+        bool: True if coordinate is in the index
+    """
+    # Check the main cell and neighboring cells (to handle boundary cases)
+    key = (
+        round(co[0] / tolerance),
+        round(co[1] / tolerance),
+        round(co[2] / tolerance)
+    )
+    
+    # Check main cell and 26 neighbors (3x3x3 cube)
+    for dx in [-1, 0, 1]:
+        for dy in [-1, 0, 1]:
+            for dz in [-1, 0, 1]:
+                neighbor_key = (key[0] + dx, key[1] + dy, key[2] + dz)
+                if neighbor_key in spatial_index:
+                    for stored_co in spatial_index[neighbor_key]:
+                        # Check actual distance
+                        dist = (
+                            (co[0] - stored_co[0]) ** 2 +
+                            (co[1] - stored_co[1]) ** 2 +
+                            (co[2] - stored_co[2]) ** 2
+                        ) ** 0.5
+                        if dist < tolerance:
+                            return True
+    
+    return False
+
+
 CHUNK_SIZE = 50000
 TIMEOUT_SECONDS = 30
 
@@ -179,6 +255,118 @@ class PET_OT_grow_selection(Operator):
             bm.verts.ensure_lookup_table()
             state.current_selection_vertex_count = sum(1 for v in bm.verts if v.select)
 
+        return {'FINISHED'}
+
+
+class PET_OT_grow_selection_boundary_aware(Operator):
+    """
+    Grow selection by one ring, respecting vertex group assignments and boundary edges.
+    
+    This is a less aggressive alternative to "Grow +" that:
+    - Only grows one ring (one edge hop)
+    - Excludes vertices already assigned to other vertex groups
+    - Respects boundary edges if pet_separation_boundary_edges data exists
+    - Prevents jumping from body to feet, head to body, etc.
+    """
+    bl_idname = "pet.grow_selection_boundary_aware"
+    bl_label = "Grow Selection (Boundary Aware)"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH' or obj.mode != 'EDIT':
+            self.report({'ERROR'}, "Must be in Edit mode on a mesh")
+            return {'CANCELLED'}
+        
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        
+        # Get current selection
+        base_selection = {v.index for v in bm.verts if v.select}
+        if not base_selection:
+            self.report({'WARNING'}, "No vertices selected")
+            bmesh.update_edit_mesh(mesh)
+            return {'CANCELLED'}
+        
+        # Build exclusion set
+        excluded = set()
+        boundary_edge_indices = set()
+        
+        # Get current part from manual part selection state
+        state = getattr(context.scene, "pet_manual_part_selection_state", None)
+        current_part = getattr(state, "current_part", "") if state and getattr(state, "is_active", False) else ""
+        
+        # Vertex group exclusion (using mesh.vertices, NOT bm.verts)
+        if current_part and obj.vertex_groups:
+            for vg in obj.vertex_groups:
+                if vg.name == current_part:
+                    continue
+                vg_index = vg.index
+                for v in mesh.vertices:
+                    # Never exclude vertices the user has explicitly selected
+                    if v.index in base_selection:
+                        continue
+                    for g in v.groups:
+                        if g.group == vg_index and g.weight > 0.5:
+                            excluded.add(v.index)
+                            break
+        
+        # Boundary edge identification (if pet_separation_boundary_edges exists)
+        stored_boundaries = obj.get("pet_separation_boundary_edges", None)
+        if stored_boundaries and len(stored_boundaries) > 0:
+            # Build spatial index from stored boundaries
+            spatial_index = build_spatial_index(stored_boundaries, tolerance=0.001)
+            
+            if spatial_index:
+                # Find edges that match stored boundary coordinates
+                for edge in bm.edges:
+                    v1_co = edge.verts[0].co
+                    v2_co = edge.verts[1].co
+                    
+                    # Check if BOTH vertices are in the stored boundary data
+                    v1_match = coord_in_spatial_index(v1_co, spatial_index, tolerance=0.001)
+                    v2_match = coord_in_spatial_index(v2_co, spatial_index, tolerance=0.001)
+                    
+                    if v1_match and v2_match:
+                        boundary_edge_indices.add(edge.index)
+                        # Add both vertices to excluded to prevent growing across boundary
+                        excluded.add(edge.verts[0].index)
+                        excluded.add(edge.verts[1].index)
+        
+        # Grow selection (single ring)
+        new_selection = set()
+        for vert_idx in base_selection:
+            vert = bm.verts[vert_idx]
+            for edge in vert.link_edges:
+                # Skip if this is a boundary edge
+                if edge.index in boundary_edge_indices:
+                    continue
+                other_vert = edge.other_vert(vert)
+                # Only add if not excluded
+                if other_vert.index not in excluded:
+                    new_selection.add(other_vert.index)
+        
+        # Final selection (union to preserve original selection)
+        final_selection = base_selection.union(new_selection)
+        
+        # Apply selection
+        for v in bm.verts:
+            v.select = v.index in final_selection
+        
+        bmesh.update_edit_mesh(mesh)
+        
+        # If manual part selection is active, keep its selection count in sync
+        if state is not None and getattr(state, "is_active", False):
+            state.current_selection_vertex_count = len(final_selection)
+        
+        added = len(final_selection) - len(base_selection)
+        if added > 0:
+            self.report({'INFO'}, f"Grew selection by {added:,} vertices (total {len(final_selection):,})")
+        else:
+            self.report({'INFO'}, "No additional vertices added (blocked by boundaries or vertex groups)")
+        
         return {'FINISHED'}
 
 
@@ -714,6 +902,7 @@ classes = [
     PET_OT_assign_selection_to_segment,
     PET_OT_select_segment,
     PET_OT_grow_selection,
+    PET_OT_grow_selection_boundary_aware,
     PET_OT_shrink_selection,
     PET_OT_smooth_selection_boundary,
     PET_OT_fill_gaps_selection,

@@ -5,9 +5,16 @@ Fills open boundaries on split parts with material-matched faces
 
 import bpy
 import bmesh
+import time
 from bpy.types import Operator
 from bpy.props import BoolProperty, EnumProperty, FloatVectorProperty
 from mathutils import Vector
+
+
+# Safety constants
+MAX_ITERATIONS_PER_LOOP = 1000  # Maximum iterations when building a single loop
+MAX_LOOPS_PER_OBJECT = 1000     # Maximum loops to process per object
+TIMEOUT_PER_OBJECT = 10.0       # Maximum seconds to spend on one object
 
 
 def extract_primary_material_color(original_obj, split_obj):
@@ -139,15 +146,92 @@ def extract_primary_material_color(original_obj, split_obj):
     return None
 
 
+def build_spatial_index(stored_boundaries, tolerance=0.001):
+    """
+    Build a spatial index from stored boundary coordinates for O(n) lookup.
+    
+    Args:
+        stored_boundaries: List of [[v1_co, v2_co], ...] coordinate pairs
+        tolerance: Distance tolerance for coordinate matching
+    
+    Returns:
+        dict: Spatial index mapping rounded coordinate tuples to sets of exact coordinates
+    """
+    spatial_index = {}
+    
+    for boundary_pair in stored_boundaries:
+        if len(boundary_pair) != 2:
+            continue
+        
+        v1_co = boundary_pair[0]
+        v2_co = boundary_pair[1]
+        
+        for co in [v1_co, v2_co]:
+            if len(co) < 3:
+                continue
+            # Create a key based on rounded coordinates
+            key = (
+                round(co[0] / tolerance),
+                round(co[1] / tolerance),
+                round(co[2] / tolerance)
+            )
+            if key not in spatial_index:
+                spatial_index[key] = set()
+            spatial_index[key].add((co[0], co[1], co[2]))
+    
+    return spatial_index
+
+
+def coord_in_spatial_index(co, spatial_index, tolerance=0.001):
+    """
+    Check if a coordinate is in the spatial index (within tolerance).
+    
+    Args:
+        co: Coordinate to check (Vector or tuple)
+        spatial_index: Spatial index from build_spatial_index()
+        tolerance: Distance tolerance for matching
+    
+    Returns:
+        bool: True if coordinate is in the index
+    """
+    # Check the main cell and neighboring cells (to handle boundary cases)
+    key = (
+        round(co[0] / tolerance),
+        round(co[1] / tolerance),
+        round(co[2] / tolerance)
+    )
+    
+    # Check main cell and 26 neighbors (3x3x3 cube)
+    for dx in [-1, 0, 1]:
+        for dy in [-1, 0, 1]:
+            for dz in [-1, 0, 1]:
+                neighbor_key = (key[0] + dx, key[1] + dy, key[2] + dz)
+                if neighbor_key in spatial_index:
+                    for stored_co in spatial_index[neighbor_key]:
+                        # Check actual distance
+                        dist = (
+                            (co[0] - stored_co[0]) ** 2 +
+                            (co[1] - stored_co[1]) ** 2 +
+                            (co[2] - stored_co[2]) ** 2
+                        ) ** 0.5
+                        if dist < tolerance:
+                            return True
+    
+    return False
+
+
 def identify_separation_boundary_edges(bm, obj, tolerance=0.001):
     """
     Identify edges that are actual separation boundaries (created during split operation).
-    Uses both edge connectivity (edges with only one face) and coordinate matching.
+    
+    Uses stored boundary data (pet_separation_boundary_edges) to identify only the edges
+    that were at vertex group boundaries during splitting. This prevents filling edges
+    that weren't part of the original cut.
     
     Args:
         bm: bmesh object
-        obj: Blender object (to check for stored boundary info)
-        tolerance: Distance tolerance for matching vertex coordinates (increased to 0.001 for gaps)
+        obj: Blender object (must have pet_separation_boundary_edges for accurate detection)
+        tolerance: Distance tolerance for coordinate matching
     
     Returns:
         set: Set of bmesh edges that are separation boundaries
@@ -159,240 +243,225 @@ def identify_separation_boundary_edges(bm, obj, tolerance=0.001):
     bm.verts.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
     
-    # PRIMARY STRATEGY: Find edges with only ONE face that match stored boundaries
-    # This is more robust than coordinate matching alone, especially after gaps are created
-    
     # Check if object has stored separation boundary info
-    if "pet_separation_boundary_edges" not in obj:
-        # No stored info - return empty set (fallback will be used)
-        return separation_edges
+    stored_boundaries = obj.get("pet_separation_boundary_edges", None) if obj else None
     
-    stored_boundaries = obj.get("pet_separation_boundary_edges", [])
-    if not stored_boundaries:
-        return separation_edges
-    
-    # Convert stored boundary coordinates back to Vectors for comparison
-    stored_edges = []
-    for boundary_pair in stored_boundaries:
-        if len(boundary_pair) == 2:
-            v1_co = Vector(boundary_pair[0])
-            v2_co = Vector(boundary_pair[1])
-            stored_edges.append((v1_co, v2_co))
-    
-    if not stored_edges:
-        return separation_edges
-    
-    # Match edges using BOTH connectivity AND coordinate matching
-    # Priority: Edges with only one face (true boundaries) that match stored coordinates
-    for edge in bm.edges:
-        # CRITICAL: Only consider edges with exactly one face (true cut boundaries)
-        # This ensures we don't match internal edges
-        if len(edge.link_faces) != 1:
-            continue
+    if stored_boundaries and len(stored_boundaries) > 0:
+        # PRIMARY METHOD: Use stored boundary data with spatial hashing
+        # This is O(n) instead of O(n*m)
         
-        v1_co = edge.verts[0].co
-        v2_co = edge.verts[1].co
+        # Build spatial index from stored boundaries
+        spatial_index = build_spatial_index(stored_boundaries, tolerance)
         
-        # Check if this edge matches any stored boundary edge
-        # Need to check both directions (v1-v2 and v2-v1)
-        for stored_v1, stored_v2 in stored_edges:
-            # Check forward direction
-            dist1_forward = (v1_co - stored_v1).length
-            dist2_forward = (v2_co - stored_v2).length
+        if not spatial_index:
+            # No valid boundary data, fall back to one-face rule
+            print("[Fill Cut Faces] Warning: Stored boundary data is empty, falling back to one-face rule")
+            for edge in bm.edges:
+                if len(edge.link_faces) == 1:
+                    separation_edges.add(edge)
+            return separation_edges
+        
+        # Find edges that:
+        # 1. Have exactly one face (are boundary edges)
+        # 2. Both vertices match stored boundary coordinates
+        matched_count = 0
+        for edge in bm.edges:
+            # Must be a boundary edge (one face)
+            if len(edge.link_faces) != 1:
+                continue
             
-            # Check reverse direction
-            dist1_reverse = (v1_co - stored_v2).length
-            dist2_reverse = (v2_co - stored_v1).length
+            v1_co = edge.verts[0].co
+            v2_co = edge.verts[1].co
             
-            # Match if both vertices are within tolerance (in either direction)
-            # Increased tolerance (0.001) handles cases where gaps were created
-            if (dist1_forward < tolerance and dist2_forward < tolerance) or \
-               (dist1_reverse < tolerance and dist2_reverse < tolerance):
+            # Check if BOTH vertices are in the stored boundary data
+            v1_match = coord_in_spatial_index(v1_co, spatial_index, tolerance)
+            v2_match = coord_in_spatial_index(v2_co, spatial_index, tolerance)
+            
+            if v1_match and v2_match:
                 separation_edges.add(edge)
-                break
+                matched_count += 1
+        
+        print(f"[Fill Cut Faces] Found {matched_count} edges matching stored boundary data (from {len(stored_boundaries)} stored boundaries)")
+        
+        # If no edges matched, there might be a coordinate mismatch (e.g., gaps were created)
+        # Fall back to one-face rule but warn the user
+        if not separation_edges:
+            print("[Fill Cut Faces] Warning: No edges matched stored boundaries, falling back to one-face rule")
+            for edge in bm.edges:
+                if len(edge.link_faces) == 1:
+                    separation_edges.add(edge)
+    else:
+        # FALLBACK: No stored boundary data, use one-face rule
+        # This is less accurate but works for backwards compatibility
+        print("[Fill Cut Faces] No stored boundary data found, using one-face rule (may include non-cut edges)")
+        for edge in bm.edges:
+            if len(edge.link_faces) == 1:
+                separation_edges.add(edge)
     
     return separation_edges
 
 
-def identify_separation_boundary_edges_fallback(bm, obj):
+def get_boundary_edges(bm, obj=None):
     """
-    Fallback method: Identify edges that are likely separation boundaries.
-    Used when stored boundary info is not available (backwards compatibility).
+    Get separation boundary edges for filling.
     
-    Strategy: Only select boundary edges (edges with only one face) that form closed loops.
-    This filters out internal holes and ensures we only get actual cut surfaces.
+    If the object has stored separation boundary data (pet_separation_boundary_edges),
+    returns only edges that match those stored coordinates. Otherwise, falls back
+    to returning all edges with only one face.
     
     Args:
         bm: bmesh object
-        obj: Blender object
+        obj: Blender object (required for accurate boundary detection)
     
     Returns:
-        set: Set of bmesh edges that are likely separation boundaries (form closed loops)
+        set: Set of boundary edges that should be filled
     """
-    boundary_edges = set()
-    
-    # Get all boundary edges (edges with only one face)
-    candidate_edges = set()
-    for edge in bm.edges:
-        if len(edge.link_faces) == 1:
-            candidate_edges.add(edge)
-    
-    if not candidate_edges:
-        return boundary_edges
-    
-    # Filter to edges that form closed loops (actual cut surfaces)
-    # Build loops from candidate edges and only keep edges that are part of closed loops
-    processed_edges = set()
-    
-    for start_edge in candidate_edges:
-        if start_edge in processed_edges:
-            continue
-        
-        # Try to build a loop from this edge
-        loop_edges = []
-        current_edge = start_edge
-        start_vert = start_edge.verts[0]
-        current_vert = start_vert
-        
-        max_iterations = len(candidate_edges) * 2
-        iteration_count = 0
-        
-        while current_edge and current_edge not in processed_edges and iteration_count < max_iterations:
-            iteration_count += 1
-            loop_edges.append(current_edge)
-            
-            # Get the other vertex
-            other_vert = current_edge.other_vert(current_vert)
-            current_vert = other_vert
-            
-            # If we've looped back to start, this is a closed loop
-            if current_vert == start_vert:
-                # This is a valid closed loop - add all edges to result
-                for e in loop_edges:
-                    boundary_edges.add(e)
-                    processed_edges.add(e)
-                break
-            
-            # Find next candidate edge connected to current vertex
-            current_edge = None
-            for e in current_vert.link_edges:
-                if e not in processed_edges and e in candidate_edges:
-                    current_edge = e
-                    break
-            
-            if not current_edge:
-                # Open end - not a closed loop, skip these edges
-                break
-    
-    return boundary_edges
-
-
-def find_open_boundaries(bm, obj=None):
-    """
-    Find open boundary loops from actual separation boundaries (edges created during split).
-    Only includes edges that match stored separation boundary info AND have only one face.
-    Validates that loops are closed before returning them.
-    
-    Args:
-        bm: bmesh object
-        obj: Blender object (to check for stored boundary info)
-    
-    Returns:
-        list: List of vertex loops (each loop is a list of bmesh vertices)
-    """
-    boundary_loops = []
-    processed_edges = set()
-    
     # Ensure lookup tables
     bm.edges.ensure_lookup_table()
     bm.verts.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
     
-    # Get actual separation boundary edges (cuts from split operation)
-    if obj:
-        separation_edges = identify_separation_boundary_edges(bm, obj)
+    # Get separation boundary edges (uses stored data if available)
+    boundary_edges = identify_separation_boundary_edges(bm, obj)
+    
+    return boundary_edges
+
+
+def build_edge_loop(start_edge, boundary_edges, processed_edges, start_time, timeout):
+    """
+    Build a single closed edge loop starting from the given edge.
+    
+    Args:
+        start_edge: bmesh edge to start from
+        boundary_edges: set of all boundary edges
+        processed_edges: set of already processed edges (will be updated)
+        start_time: time when operation started (for timeout checking)
+        timeout: maximum seconds to spend
+    
+    Returns:
+        list: List of edges forming a closed loop, or None if loop couldn't be built
+    """
+    if start_edge in processed_edges:
+        return None
+    
+    loop_edges = [start_edge]
+    processed_edges.add(start_edge)
+    
+    current_edge = start_edge
+    current_vert = start_edge.verts[1]
+    start_vert = start_edge.verts[0]
+    
+    iter_count = 0
+    
+    while iter_count < MAX_ITERATIONS_PER_LOOP:
+        # Check timeout
+        if time.time() - start_time > timeout:
+            return None
         
-        # Fallback if no stored boundary info (backwards compatibility)
-        if not separation_edges:
-            separation_edges = identify_separation_boundary_edges_fallback(bm, obj)
-    else:
-        # No object provided - use fallback
-        separation_edges = set()
-        for edge in bm.edges:
-            # CRITICAL: Only edges with exactly one face (true boundaries)
-            if len(edge.link_faces) == 1:
-                separation_edges.add(edge)
+        iter_count += 1
+        next_edge = None
+        
+        # Find next boundary edge connected to current vertex
+        for e in current_vert.link_edges:
+            if e in boundary_edges and e not in processed_edges:
+                # Verify it's still a boundary edge (safety check)
+                if len(e.link_faces) == 1:
+                    next_edge = e
+                    break
+        
+        if not next_edge:
+            # Open end - not a closed loop
+            # Remove edges from processed set so they can be tried again
+            for e in loop_edges:
+                processed_edges.discard(e)
+            return None
+        
+        loop_edges.append(next_edge)
+        processed_edges.add(next_edge)
+        current_vert = next_edge.other_vert(current_vert)
+        
+        # Check if we've looped back to start
+        if current_vert == start_vert:
+            # Closed loop found - validate it has enough edges
+            if len(loop_edges) >= 3:
+                return loop_edges
+            else:
+                # Too few edges - remove from processed
+                for e in loop_edges:
+                    processed_edges.discard(e)
+                return None
     
-    if not separation_edges:
-        return boundary_loops
+    # Max iterations reached - remove from processed
+    for e in loop_edges:
+        processed_edges.discard(e)
+    return None
+
+
+def find_and_fill_loops(bm, boundary_edges, material_index, start_time, timeout, progress_callback=None):
+    """
+    Find all closed loops from boundary edges and fill them one at a time.
     
-    # Build loops from separation boundary edges only
-    # CRITICAL: Only build loops from edges with exactly one face
-    for edge in separation_edges:
-        if edge in processed_edges:
+    Args:
+        bm: bmesh object
+        boundary_edges: set of boundary edges to process
+        material_index: material index to assign to created faces
+        start_time: time when operation started
+        timeout: maximum seconds to spend
+        progress_callback: optional function to call for progress updates
+    
+    Returns:
+        int: Number of faces created
+    """
+    if not boundary_edges:
+        return 0
+    
+    faces_created = 0
+    processed_edges = set()
+    boundary_edges_list = list(boundary_edges)
+    loops_processed = 0
+    
+    # Process loops one at a time
+    for start_edge in boundary_edges_list:
+        # Check timeout
+        if time.time() - start_time > timeout:
+            break
+        
+        # Check max loops limit
+        if loops_processed >= MAX_LOOPS_PER_OBJECT:
+            break
+        
+        # Try to build a loop from this edge
+        loop_edges = build_edge_loop(start_edge, boundary_edges, processed_edges, start_time, timeout)
+        
+        if not loop_edges:
             continue
         
-        # CRITICAL: Only process edges with exactly one face (true cut boundaries)
-        if len(edge.link_faces) != 1:
+        # Fill the loop
+        try:
+            result = bmesh.ops.edgeloop_fill(bm, edges=loop_edges)
+            
+            if 'faces' in result:
+                for face in result['faces']:
+                    try:
+                        face.material_index = material_index
+                        faces_created += 1
+                    except (AttributeError, RuntimeError):
+                        # Face might have been invalidated, skip it
+                        pass
+            
+            loops_processed += 1
+            
+            # Update progress if callback provided
+            if progress_callback:
+                progress_callback(loops_processed)
+                
+        except (ValueError, RuntimeError) as e:
+            # Loop fill failed - remove edges from processed so they can be retried
+            for e in loop_edges:
+                processed_edges.discard(e)
             continue
-        
-        # This edge is a separation boundary - find its connected loop
-        loop_edges = []
-        loop_verts = []
-        
-        # Start from this edge
-        current_edge = edge
-        start_vert = edge.verts[0]
-        current_vert = start_vert
-        loop_verts.append(start_vert)
-        
-        max_iterations = len(separation_edges) * 2  # Safety limit
-        iteration_count = 0
-        is_closed = False
-        
-        while current_edge and current_edge not in processed_edges and iteration_count < max_iterations:
-            iteration_count += 1
-            processed_edges.add(current_edge)
-            loop_edges.append(current_edge)
-            
-            # Get the other vertex
-            other_vert = current_edge.other_vert(current_vert)
-            if other_vert not in loop_verts:
-                loop_verts.append(other_vert)
-            
-            current_vert = other_vert
-            
-            # If we've looped back to start, this is a closed loop
-            if current_vert == start_vert:
-                is_closed = True
-                break
-            
-            # Find next separation boundary edge connected to current vertex
-            # CRITICAL: Only follow edges that are in separation_edges AND have only one face
-            current_edge = None
-            for e in current_vert.link_edges:
-                if e not in processed_edges and e in separation_edges:
-                    # Double-check: edge must have only one face
-                    if len(e.link_faces) == 1:
-                        current_edge = e
-                        break
-            
-            if not current_edge:
-                # Open end - not a closed loop
-                break
-        
-        # VALIDATION: Only add loops that are closed and have enough edges
-        # Closed loops need at least 3 edges to form a valid face
-        if is_closed and len(loop_edges) >= 3:
-            # Additional validation: check that loop vertices are distinct
-            if len(loop_verts) >= 3 and len(set(loop_verts)) == len(loop_verts):
-                boundary_loops.append(loop_verts)
-            elif len(loop_verts) >= 3:
-                # Loop has duplicate vertices but might still be valid (self-intersecting)
-                # Check if it forms a valid boundary
-                boundary_loops.append(loop_verts)
     
-    return boundary_loops
+    return faces_created
 
 
 class PET_OT_fill_cut_faces(Operator):
@@ -432,233 +501,169 @@ class PET_OT_fill_cut_faces(Operator):
         
         total_faces_created = 0
         processed_objects = 0
+        failed_objects = []
         
-        for obj in selected_objects:
-            if context.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
-            
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-            
-            bpy.ops.object.mode_set(mode='EDIT')
-            
-            bm = bmesh.from_edit_mesh(obj.data)
-            bm.faces.ensure_lookup_table()
-            bm.edges.ensure_lookup_table()
-            bm.verts.ensure_lookup_table()
-            
-            # Find open boundary loops (only from actual separation boundaries)
-            boundary_loops = find_open_boundaries(bm, obj)
-            
-            if not boundary_loops:
-                bmesh.update_edit_mesh(obj.data)
-                bm.free()
-                bpy.ops.object.mode_set(mode='OBJECT')
-                continue
-            
-            # Get material color
-            fill_color = None
-            if self.use_material_color:
-                fill_color = extract_primary_material_color(original_obj, obj)
-            
-            # CRITICAL: Ensure fallback color is used if material detection fails
-            # Default to gray (0.3, 0.3, 0.3) which is hidden inside model when reconnected
-            if not fill_color:
-                fill_color = tuple(self.fallback_color[:3]) if len(self.fallback_color) >= 3 else (0.3, 0.3, 0.3)
-            
-            # Validate color values
-            if not all(0.0 <= c <= 1.0 for c in fill_color[:3]):
-                fill_color = (0.3, 0.3, 0.3)  # Safe fallback to gray
-            
-            # Create material for filled faces if needed
-            material = None
-            material_name = f"{obj.name}_FillMaterial"
-            
-            # Check if material already exists
-            if material_name in bpy.data.materials:
-                material = bpy.data.materials[material_name]
-            else:
-                # Create new material
-                material = bpy.data.materials.new(name=material_name)
-                material.use_nodes = True
+        # Initialize progress reporting
+        wm = context.window_manager
+        total_work = len(selected_objects)
+        wm.progress_begin(0, total_work)
+        
+        try:
+            for obj_idx, obj in enumerate(selected_objects):
+                # Update progress
+                wm.progress_update(obj_idx)
                 
-                # Set up Principled BSDF with extracted color
-                if material.node_tree:
-                    principled = material.node_tree.nodes.get('Principled BSDF')
-                    if principled:
-                        principled.inputs['Base Color'].default_value = (*fill_color, 1.0)
-                        principled.inputs['Metallic'].default_value = 0.0
-                        principled.inputs['Roughness'].default_value = 0.8
-            
-            # Add material to object if not present
-            if material.name not in obj.data.materials:
-                obj.data.materials.append(material)
-            material_index = obj.data.materials.find(material.name)
-            
-            # Fill each boundary loop
-            faces_created = 0
-            for loop_verts in boundary_loops:
-                if len(loop_verts) < 3:
-                    continue
+                obj_start_time = time.time()
                 
-                # CRITICAL: Check if a face already exists for these vertices
-                # This prevents creating overlapping faces on existing geometry
-                face_already_exists = False
-                loop_vert_indices = {v.index for v in loop_verts}
-                
-                # Check all faces to see if any face uses all vertices in this loop
-                for face in bm.faces:
-                    face_vert_indices = {v.index for v in face.verts}
-                    # If the face contains all vertices from the loop, a face already exists
-                    if loop_vert_indices.issubset(face_vert_indices):
-                        face_already_exists = True
-                        break
-                
-                if face_already_exists:
-                    # Face already exists - skip this loop (don't create overlapping geometry)
-                    continue
-                
-                # CRITICAL: Verify that all edges in the loop have only one face
-                # This ensures we're only filling actual gaps, not internal edges
-                all_edges_are_boundaries = True
-                for i in range(len(loop_verts)):
-                    v1 = loop_verts[i]
-                    v2 = loop_verts[(i + 1) % len(loop_verts)]
-                    
-                    # Find edge connecting these vertices
-                    edge = None
-                    for e in v1.link_edges:
-                        if e.other_vert(v1) == v2:
-                            edge = e
-                            break
-                    
-                    if edge and len(edge.link_faces) != 1:
-                        # Edge has more than one face - not a true boundary
-                        all_edges_are_boundaries = False
-                        break
-                
-                if not all_edges_are_boundaries:
-                    # Not all edges are boundaries - skip this loop
-                    continue
-                
-                # Try creating face directly from vertex loop
                 try:
-                    face = bm.faces.new(loop_verts)
-                    face.material_index = material_index
-                    faces_created += 1
-                except (ValueError, RuntimeError) as e:
-                    # Face creation failed (might be degenerate, non-planar, or non-manifold)
-                    # Try improved triangulation methods
-                    try:
-                        if len(loop_verts) >= 3:
-                            # Method 1: Fan triangulation from first vertex
-                            # This works well for convex loops
-                            first_vert = loop_verts[0]
-                            fan_success = False
-                            
-                            for i in range(1, len(loop_verts) - 1):
-                                try:
-                                    # Check if this triangle would create an overlapping face
-                                    tri_verts = [first_vert, loop_verts[i], loop_verts[i + 1]]
-                                    tri_vert_indices = {v.index for v in tri_verts}
-                                    
-                                    # Check if a face already exists for these three vertices
-                                    tri_face_exists = False
-                                    for face in bm.faces:
-                                        face_vert_indices = {v.index for v in face.verts}
-                                        if tri_vert_indices.issubset(face_vert_indices):
-                                            tri_face_exists = True
-                                            break
-                                    
-                                    if not tri_face_exists:
-                                        tri_face = bm.faces.new(tri_verts)
-                                        tri_face.material_index = material_index
-                                        faces_created += 1
-                                        fan_success = True
-                                except (ValueError, RuntimeError):
-                                    # Skip this triangle if it fails
-                                    continue
-                            
-                            # Method 2: If fan triangulation failed, try ear clipping approach
-                            # This works better for concave loops
-                            if not fan_success and len(loop_verts) >= 4:
-                                # Try creating triangles from different starting points
-                                for start_idx in range(min(3, len(loop_verts))):  # Try first 3 vertices as starting points
-                                    start_vert = loop_verts[start_idx]
-                                    created_any = False
-                                    
-                                    for i in range(1, len(loop_verts) - 1):
-                                        idx1 = (start_idx + i) % len(loop_verts)
-                                        idx2 = (start_idx + i + 1) % len(loop_verts)
-                                        
-                                        if idx1 == idx2 or idx1 == start_idx or idx2 == start_idx:
-                                            continue
-                                        
-                                        try:
-                                            tri_verts = [start_vert, loop_verts[idx1], loop_verts[idx2]]
-                                            
-                                            # Validate triangle (check for degenerate cases)
-                                            v0 = tri_verts[0].co
-                                            v1 = tri_verts[1].co
-                                            v2 = tri_verts[2].co
-                                            
-                                            # Check if triangle is degenerate (zero area)
-                                            edge1 = v1 - v0
-                                            edge2 = v2 - v0
-                                            cross = edge1.cross(edge2)
-                                            if cross.length < 0.0001:
-                                                continue  # Degenerate triangle, skip
-                                            
-                                            tri_vert_indices = {v.index for v in tri_verts}
-                                            
-                                            # Check if a face already exists
-                                            tri_face_exists = False
-                                            for face in bm.faces:
-                                                face_vert_indices = {v.index for v in face.verts}
-                                                if tri_vert_indices.issubset(face_vert_indices):
-                                                    tri_face_exists = True
-                                                    break
-                                            
-                                            if not tri_face_exists:
-                                                tri_face = bm.faces.new(tri_verts)
-                                                tri_face.material_index = material_index
-                                                faces_created += 1
-                                                created_any = True
-                                        except (ValueError, RuntimeError):
-                                            continue
-                                    
-                                    if created_any:
-                                        break  # Success with this starting point
-                    except Exception:
-                        # Skip this loop entirely if all triangulation methods fail
+                    # Ensure we're in object mode
+                    if context.mode != 'OBJECT':
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    
+                    # Select this object
+                    bpy.ops.object.select_all(action='DESELECT')
+                    obj.select_set(True)
+                    context.view_layer.objects.active = obj
+                    
+                    # Enter edit mode
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    
+                    # Get bmesh
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    
+                    # Ensure lookup tables
+                    bm.faces.ensure_lookup_table()
+                    bm.edges.ensure_lookup_table()
+                    bm.verts.ensure_lookup_table()
+                    
+                    # Get boundary edges (edges with only one face)
+                    boundary_edges = get_boundary_edges(bm, obj)
+                    
+                    if not boundary_edges:
+                        bmesh.update_edit_mesh(obj.data)
+                        bm.free()
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                        continue
+                    
+                    # Get material color
+                    fill_color = None
+                    if self.use_material_color:
+                        fill_color = extract_primary_material_color(original_obj, obj)
+                    
+                    # CRITICAL: Ensure fallback color is used if material detection fails
+                    # Default to gray (0.3, 0.3, 0.3) which is hidden inside model when reconnected
+                    if not fill_color:
+                        fill_color = tuple(self.fallback_color[:3]) if len(self.fallback_color) >= 3 else (0.3, 0.3, 0.3)
+                    
+                    # Validate color values
+                    if not all(0.0 <= c <= 1.0 for c in fill_color[:3]):
+                        fill_color = (0.3, 0.3, 0.3)  # Safe fallback to gray
+                    
+                    # Create material for filled faces if needed
+                    material = None
+                    material_name = f"{obj.name}_FillMaterial"
+                    
+                    # Check if material already exists
+                    if material_name in bpy.data.materials:
+                        material = bpy.data.materials[material_name]
+                    else:
+                        # Create new material
+                        material = bpy.data.materials.new(name=material_name)
+                        material.use_nodes = True
+                        
+                        # Set up Principled BSDF with extracted color
+                        if material.node_tree:
+                            principled = material.node_tree.nodes.get('Principled BSDF')
+                            if principled:
+                                principled.inputs['Base Color'].default_value = (*fill_color, 1.0)
+                                principled.inputs['Metallic'].default_value = 0.0
+                                principled.inputs['Roughness'].default_value = 0.8
+                    
+                    # Add material to object if not present
+                    if material.name not in obj.data.materials:
+                        obj.data.materials.append(material)
+                    material_index = obj.data.materials.find(material.name)
+                    
+                    # Find and fill loops one at a time (prevents freezing)
+                    def progress_callback(loops_done):
+                        """Update progress during loop processing"""
+                        # Progress is already updated per object, but we could add per-loop updates here
                         pass
-            
-            total_faces_created += faces_created
-            
-            # Update mesh
-            bmesh.update_edit_mesh(obj.data)
-            bm.free()
-            
-            # Recalculate normals
-            bpy.ops.object.mode_set(mode='OBJECT')
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.normals_make_consistent(inside=False)
-            bpy.ops.object.mode_set(mode='OBJECT')
-            
-            processed_objects += 1
+                    
+                    faces_created = find_and_fill_loops(
+                        bm,
+                        boundary_edges,
+                        material_index,
+                        obj_start_time,
+                        TIMEOUT_PER_OBJECT,
+                        progress_callback
+                    )
+                    
+                    total_faces_created += faces_created
+                    
+                    # Recalculate normals using bmesh ops (non-blocking)
+                    try:
+                        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+                    except (ValueError, RuntimeError):
+                        # If recalc fails, try updating mesh and using bpy.ops as fallback
+                        bmesh.update_edit_mesh(obj.data)
+                        bm.free()
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                        bpy.ops.object.mode_set(mode='EDIT')
+                        try:
+                            bpy.ops.mesh.normals_make_consistent(inside=False)
+                        except RuntimeError:
+                            pass
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    else:
+                        # Update mesh and free bmesh
+                        bmesh.update_edit_mesh(obj.data)
+                        bm.free()
+                        bpy.ops.object.mode_set(mode='OBJECT')
+                    
+                    processed_objects += 1
+                    
+                except Exception as e:
+                    # Log error but continue with other objects
+                    failed_objects.append((obj.name, str(e)))
+                    try:
+                        bm.free()
+                    except:
+                        pass
+                    try:
+                        if context.mode != 'OBJECT':
+                            bpy.ops.object.mode_set(mode='OBJECT')
+                    except:
+                        pass
+                    continue
+                    
+        finally:
+            # End progress reporting
+            wm.progress_end()
         
         # Restore selection
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in selected_objects:
-            obj.select_set(True)
-        if selected_objects:
-            context.view_layer.objects.active = selected_objects[0]
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in selected_objects:
+                obj.select_set(True)
+            if selected_objects:
+                context.view_layer.objects.active = selected_objects[0]
+        except RuntimeError:
+            # Selection restore failed, but that's okay
+            pass
         
+        # Report results
         if processed_objects > 0:
-            self.report({'INFO'}, f"Created {total_faces_created} fill faces on {processed_objects} object(s)")
+            msg = f"Created {total_faces_created} fill faces on {processed_objects} object(s)"
+            if failed_objects:
+                msg += f" ({len(failed_objects)} object(s) failed)"
+            self.report({'INFO'}, msg)
+            
+            if failed_objects:
+                for obj_name, error in failed_objects[:3]:  # Show first 3 errors
+                    self.report({'WARNING'}, f"{obj_name}: {error}")
         else:
-            self.report({'WARNING'}, "No open boundaries found to fill")
+            self.report({'WARNING'}, "No open boundaries found to fill or all objects failed")
         
         return {'FINISHED'}
 

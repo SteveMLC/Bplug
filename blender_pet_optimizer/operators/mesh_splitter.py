@@ -438,6 +438,24 @@ class PET_OT_split_by_vertex_groups(Operator):
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
         
+        # Get settings from scene properties (fallback to operator properties for backwards compatibility)
+        # Priority: Scene settings (for UI consistency), but operator properties are used if scene settings don't exist
+        # When called from UI button, operator properties have defaults, so scene settings (user's choices) are used
+        # When called programmatically with explicit params, those are set on self.*, but scene settings take precedence
+        # Note: For programmatic calls that need to override scene settings, set scene settings before calling operator
+        try:
+            settings = context.scene.pet_split_settings
+            keep_original = settings.keep_original if hasattr(settings, 'keep_original') else self.keep_original
+            verify_data = settings.verify_data if hasattr(settings, 'verify_data') else self.verify_data
+            gap_distance = settings.gap_distance if hasattr(settings, 'gap_distance') else self.gap_distance
+            create_pivots = settings.create_pivots if hasattr(settings, 'create_pivots') else self.create_pivots
+        except AttributeError:
+            # Scene property doesn't exist (e.g., during addon reload) - use operator properties
+            keep_original = self.keep_original
+            verify_data = self.verify_data
+            gap_distance = self.gap_distance
+            create_pivots = self.create_pivots
+        
         mesh = obj.data
         created_objects = []
         all_pivots = []
@@ -447,7 +465,7 @@ class PET_OT_split_by_vertex_groups(Operator):
         # CRITICAL: These positions are at actual separation boundaries (where appendage meets body)
         # Must be stored BEFORE creating gaps so R6 joints can use them
         attachment_points = {}
-        if self.create_pivots:
+        if create_pivots:
             attachment_points = calculate_attachment_points_from_vertex_groups(obj)
             # Store attachment points in original object metadata for R6 joints operator
             # Format: {(group1_name, group2_name): Vector(position), ...}
@@ -488,16 +506,16 @@ class PET_OT_split_by_vertex_groups(Operator):
             # CRITICAL: Store mesh reference before splitting - original mesh gets modified
             # We need to work with a fresh reference each time
             
-            # Sort vertex groups: process body FIRST to ensure it captures all vertices
-            # within its spatial boundary before appendages claim them
+            # Sort vertex groups: process body LAST to ensure it captures all remaining vertices
+            # Body acts as a catch-all for faces not explicitly assigned to appendages
             vertex_groups_list = list(obj.vertex_groups)
             body_names = {'body', 'torso', 'core', 'Body', 'Torso', 'Core', 'BODY', 'TORSO', 'CORE'}
             
             def get_processing_priority(vg):
-                """Return 0 for body (process first), 1 for others"""
-                return 0 if vg.name in body_names else 1
+                """Return 1 for body (process last as catch-all), 0 for appendages"""
+                return 1 if vg.name in body_names else 0
             
-            # Sort: body groups first (priority 0), then others (priority 1)
+            # Sort: appendages first (priority 0), then body (priority 1) as catch-all
             vertex_groups_list.sort(key=get_processing_priority)
             
             # CRITICAL: Calculate body spatial boundaries BEFORE any splitting
@@ -647,28 +665,64 @@ class PET_OT_split_by_vertex_groups(Operator):
                                     other_group_vertices.add(vertex.index)
                                     break
                 
-                # Select faces: include if ANY vertex is in spatially-included set
-                # BUT exclude faces where majority of vertices belong to OTHER groups
-                # This ensures isolated vertices are captured while respecting segment boundaries
-                faces_selected = 0
-                for face in bm.faces:
-                    # Check if any vertex in face is in the vertex group (including spatially-included)
-                    has_vertex_in_group = any(vertex_mask[v.index] for v in face.verts)
-                    
-                    # Check if majority of vertices belong to OTHER groups (exclusion check)
-                    verts_in_other_groups = sum(1 for v in face.verts if v.index in other_group_vertices)
-                    majority_in_other_groups = verts_in_other_groups >= len(face.verts) / 2
-                    
-                    # Include face if it has vertices in our group AND doesn't belong to other groups
-                    if has_vertex_in_group and not majority_in_other_groups:
-                        face.select = True
-                        faces_selected += 1
+                # SELECT LINKED APPROACH: Start with vertex group vertices,
+                # select all connected geometry, then only exclude clear boundaries
                 
-                # ENHANCE: Include connected faces that don't cross boundaries
-                # This ensures internal faces (like inside horns) are included
-                faces_selected = self._expand_face_selection_within_boundaries(
-                    bm, vertex_mask, separation_boundary_edges
-                )
+                # Step 1: Select all vertices in the vertex group
+                for vert in bm.verts:
+                    vert.select = vertex_mask[vert.index]
+                
+                # Step 2: Extend selection to all faces containing selected vertices
+                for face in bm.faces:
+                    if any(v.select for v in face.verts):
+                        face.select = True
+                        for v in face.verts:
+                            v.select = True
+                
+                # Step 3: Flood-fill to include all connected faces
+                # Stop only at faces where MAJORITY of vertices belong to OTHER groups
+                added = True
+                while added:
+                    added = False
+                    for face in bm.faces:
+                        if face.select:
+                            continue
+                        
+                        # Check if adjacent to a selected face (via EDGE)
+                        is_adjacent = False
+                        for edge in face.edges:
+                            for linked in edge.link_faces:
+                                if linked != face and linked.select:
+                                    is_adjacent = True
+                                    break
+                            if is_adjacent:
+                                break
+                        
+                        # ALSO check if shares a VERTEX with selected face
+                        # This catches orphan faces that are only vertex-connected, not edge-connected
+                        if not is_adjacent:
+                            for vert in face.verts:
+                                for linked_face in vert.link_faces:
+                                    if linked_face != face and linked_face.select:
+                                        is_adjacent = True
+                                        break
+                                if is_adjacent:
+                                    break
+                        
+                        if not is_adjacent:
+                            continue
+                        
+                        # Only EXCLUDE if MAJORITY of vertices are in other groups
+                        # This is the ONLY exclusion rule - keeps logic simple
+                        other_count = sum(1 for v in face.verts if v.index in other_group_vertices)
+                        if other_count <= len(face.verts) / 2:
+                            # Not majority in other groups - include it
+                            face.select = True
+                            for v in face.verts:
+                                v.select = True
+                            added = True
+                
+                faces_selected = sum(1 for f in bm.faces if f.select)
                 
                 # Update edit mesh with selection
                 bmesh.update_edit_mesh(current_mesh)
@@ -710,7 +764,7 @@ class PET_OT_split_by_vertex_groups(Operator):
                         new_obj["pet_source_vertex_group"] = vg.name
                     
                     # Verify data preservation if requested
-                    if self.verify_data:
+                    if verify_data:
                         is_valid, warnings = verify_split_data_preservation(original_obj, new_obj, vg.name)
                         if warnings:
                             verification_warnings.extend([f"{vg.name}: {w}" for w in warnings])
@@ -724,27 +778,31 @@ class PET_OT_split_by_vertex_groups(Operator):
                     # If no new object was created, the selection might have failed
                     self.report({'WARNING'}, f"Failed to split vertex group: {vg.name} - no new object created")
             
-            # Create gaps between parts (if gap_distance > 0)
-            # This moves parts apart for filling/smoothing workflow
-            # IMPORTANT: Pivot positions were already calculated BEFORE splitting
-            # Gaps don't affect stored pivot positions - they're at original boundaries
-            body_obj = None
-            if self.gap_distance > 0.0 and created_objects:
-                body_obj = self._find_body_object(created_objects, obj)
-                if body_obj:
-                    self._apply_gap_separation(created_objects, body_obj, self.gap_distance)
-                else:
-                    self.report({'WARNING'}, "Could not find body object - skipping gap creation")
+            # CLEANUP: Assign any remaining orphan faces to nearest split object
+            # This ensures no holes in the final split meshes
+            if original_obj and original_obj.data.polygons:
+                orphan_count = self._cleanup_orphan_faces(context, original_obj, created_objects)
+                if orphan_count > 0:
+                    self.report({'INFO'}, f"Assigned {orphan_count} orphan faces to body")
+            
+            # REMOVED: Gap separation now available in Post-Split Cleanup
+            # Users can create gaps after splitting for visual review if needed
+            # if gap_distance > 0.0 and created_objects:
+            #     body_obj = self._find_body_object(created_objects, obj)
+            #     if body_obj:
+            #         self._apply_gap_separation(created_objects, body_obj, gap_distance)
+            #     else:
+            #         self.report({'WARNING'}, "Could not find body object - skipping gap creation")
             
             # Create pivot points using pre-calculated positions (BEFORE deleting original)
             # Pivot positions are at original attachment boundaries (before gaps)
-            if self.create_pivots and attachment_points and created_objects:
+            if create_pivots and attachment_points and created_objects:
                 pivots = self.create_pivot_points_from_attachments(obj, created_objects, attachment_points)
                 all_pivots.extend(pivots)
             
             # Optionally delete original object (AFTER creating pivots)
             original_obj_name = obj.name  # Store name before deletion
-            if not self.keep_original and created_objects:
+            if not keep_original and created_objects:
                 # Only delete if we successfully created split objects
                 try:
                     bpy.data.objects.remove(obj, do_unlink=True)
@@ -754,8 +812,6 @@ class PET_OT_split_by_vertex_groups(Operator):
             
             # Report results
             result_msg = f"Split into {len(created_objects)} objects"
-            if self.gap_distance > 0.0:
-                result_msg += f" with {self.gap_distance:.3f} gap separation"
             if all_pivots:
                 result_msg += f" and {len(all_pivots)} pivot points"
             if verification_warnings:
@@ -1138,6 +1194,95 @@ class PET_OT_split_by_vertex_groups(Operator):
         
         return updated_mask
     
+    def _include_boundary_adjacent_vertices(self, bm, vertex_mask, other_group_vertices, max_patch_size=5):
+        """
+        Include small vertex patches that are immediately adjacent to the selection boundary
+        but weren't captured by other expansion methods.
+        
+        This targets the "straggler" vertices at cut boundaries (e.g., tail base, leg joints).
+        
+        Args:
+            bm: bmesh object (in edit mesh state)
+            vertex_mask: List[bool] - Current vertex mask (True for vertices in group)
+            other_group_vertices: Set of vertex indices belonging to other groups
+            max_patch_size: Maximum size of isolated patch to include
+        
+        Returns:
+            List[bool]: Updated vertex_mask with boundary-adjacent vertices included
+        """
+        updated_mask = list(vertex_mask)
+        
+        # Find boundary vertices (selected vertices with unselected neighbors)
+        boundary_verts = set()
+        for vert_idx, in_group in enumerate(vertex_mask):
+            if not in_group or vert_idx >= len(bm.verts):
+                continue
+            vert = bm.verts[vert_idx]
+            for edge in vert.link_edges:
+                neighbor = edge.other_vert(vert)
+                if not vertex_mask[neighbor.index]:
+                    boundary_verts.add(vert_idx)
+                    break
+        
+        if not boundary_verts:
+            return updated_mask
+        
+        # Find unselected vertices adjacent to boundary that are NOT in other groups
+        candidates = set()
+        for boundary_vert_idx in boundary_verts:
+            if boundary_vert_idx >= len(bm.verts):
+                continue
+            vert = bm.verts[boundary_vert_idx]
+            for edge in vert.link_edges:
+                neighbor = edge.other_vert(vert)
+                n_idx = neighbor.index
+                # Include if: not selected, not in other groups
+                if not updated_mask[n_idx] and n_idx not in other_group_vertices:
+                    candidates.add(n_idx)
+        
+        if not candidates:
+            return updated_mask
+        
+        # For each candidate, check if it's part of a small isolated patch
+        # (not connected to many other unselected non-other-group vertices)
+        added_count = 0
+        visited = set()
+        
+        for candidate in candidates:
+            if candidate in visited or updated_mask[candidate]:
+                continue
+            
+            # BFS to find connected patch of unselected, non-other-group vertices
+            patch = set()
+            queue = [candidate]
+            visited.add(candidate)
+            
+            while queue and len(patch) <= max_patch_size:
+                current = queue.pop(0)
+                patch.add(current)
+                
+                if current >= len(bm.verts):
+                    continue
+                vert = bm.verts[current]
+                for edge in vert.link_edges:
+                    neighbor = edge.other_vert(vert)
+                    n_idx = neighbor.index
+                    if n_idx in visited or updated_mask[n_idx] or n_idx in other_group_vertices:
+                        continue
+                    visited.add(n_idx)
+                    queue.append(n_idx)
+            
+            # Include patch if it's small enough
+            if len(patch) <= max_patch_size:
+                for v_idx in patch:
+                    updated_mask[v_idx] = True
+                    added_count += 1
+        
+        if added_count > 0:
+            print(f"[Mesh Splitter] Added {added_count} boundary-adjacent straggler vertices")
+        
+        return updated_mask
+    
     def _expand_face_selection_within_boundaries(self, bm, vertex_mask, boundary_edges):
         """
         Expand face selection to include connected faces that don't cross boundaries.
@@ -1295,6 +1440,114 @@ class PET_OT_split_by_vertex_groups(Operator):
             # Store metadata for potential restoration
             part_obj["pet_gap_offset"] = list(offset)
             part_obj["pet_has_gap"] = True
+    
+    def _cleanup_orphan_faces(self, context, original_obj, created_objects):
+        """
+        Find any faces remaining in the original mesh after all splits
+        and assign them to the nearest split object by spatial proximity.
+        
+        This is the final safety net to ensure no holes in the split meshes.
+        
+        Args:
+            context: Blender context
+            original_obj: Original object that may still have orphan faces
+            created_objects: List of split objects created from the original
+        
+        Returns:
+            int: Number of orphan faces that were joined
+        """
+        if not original_obj or not created_objects:
+            return 0
+        
+        # Check if original still has geometry
+        if not original_obj.data.polygons:
+            return 0
+        
+        orphan_count = len(original_obj.data.polygons)
+        if orphan_count == 0:
+            return 0
+        
+        print(f"[Mesh Splitter] Found {orphan_count} orphan faces - assigning to nearest split objects")
+        
+        # Ensure we're in object mode
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        
+        # Group orphan faces by their nearest split object using bounding box containment
+        import bmesh
+        from mathutils import Vector
+        
+        bm = bmesh.new()
+        bm.from_mesh(original_obj.data)
+        bm.faces.ensure_lookup_table()
+        
+        # For each face, find the best split object
+        face_assignments = {}  # {split_obj: [face_indices]}
+        for face in bm.faces:
+            # Calculate face center in world space
+            face_center = original_obj.matrix_world @ face.calc_center_median()
+            
+            # First, check if face center is INSIDE any object's bounding box
+            best_obj = None
+            best_dist = float('inf')
+            
+            for split_obj in created_objects:
+                if not split_obj.data.vertices:
+                    continue
+                
+                # Get bounding box in world space
+                bbox_corners = [split_obj.matrix_world @ Vector(corner) for corner in split_obj.bound_box]
+                bbox_min = Vector((min(c.x for c in bbox_corners),
+                                 min(c.y for c in bbox_corners),
+                                 min(c.z for c in bbox_corners)))
+                bbox_max = Vector((max(c.x for c in bbox_corners),
+                                 max(c.y for c in bbox_corners),
+                                 max(c.z for c in bbox_corners)))
+                
+                # Check containment - if inside, this is the best match
+                if (bbox_min.x <= face_center.x <= bbox_max.x and
+                    bbox_min.y <= face_center.y <= bbox_max.y and
+                    bbox_min.z <= face_center.z <= bbox_max.z):
+                    best_obj = split_obj
+                    break
+                
+                # Track nearest bbox center as fallback
+                bbox_center = sum(bbox_corners, Vector((0, 0, 0))) / len(bbox_corners)
+                dist = (face_center - bbox_center).length
+                if dist < best_dist:
+                    best_dist = dist
+                    best_obj = split_obj
+            
+            if best_obj:
+                if best_obj not in face_assignments:
+                    face_assignments[best_obj] = []
+                face_assignments[best_obj].append(face.index)
+        
+        bm.free()
+        
+        # Now join the original object (with orphans) to the appropriate split objects
+        # For simplicity, join ALL orphans to the object that has the most assigned orphans
+        # (Usually they all belong to the same nearby object)
+        if face_assignments:
+            # Find the object with most orphan faces assigned
+            best_target = max(face_assignments.keys(), key=lambda o: len(face_assignments[o]))
+            assigned_count = len(face_assignments[best_target])
+            
+            # Clear selections
+            bpy.ops.object.select_all(action='DESELECT')
+            
+            # Select target and original
+            context.view_layer.objects.active = best_target
+            best_target.select_set(True)
+            original_obj.select_set(True)
+            
+            # Join
+            bpy.ops.object.join()
+            
+            print(f"[Mesh Splitter] Joined {orphan_count} orphan faces to '{best_target.name}' (nearest by proximity)")
+            return orphan_count
+        
+        return 0
     
     def create_pivot_points_from_attachments(self, original_obj, split_objects, attachment_points):
         """
