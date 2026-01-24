@@ -1348,6 +1348,9 @@ class PET_PT_edge_cut_segmentation(Panel):
             
             # Grow/Shrink row
             grow_shrink_row = refine_col.row(align=True)
+            # Add Grow - button first (weakest - plane aware)
+            grow_minus_op = grow_shrink_row.operator("pet.grow_selection_plane_aware", text="Grow -", icon='FULLSCREEN_ENTER')
+            # Grow + button (strongest - no restrictions)
             grow_op = grow_shrink_row.operator("pet.grow_selection", text="Grow +", icon='FULLSCREEN_ENTER')
             grow_op.iterations = 1
             shrink_op = grow_shrink_row.operator("pet.shrink_selection", text="Shrink -", icon='FULLSCREEN_EXIT')
@@ -1944,7 +1947,11 @@ class PET_PT_manual_part_selection(Panel):
                 current_box.label(text="Adjust Selection:", icon='MODIFIER')
                 
                 edit_row = current_box.row(align=True)
+                # Add Grow - button first (weakest)
+                edit_row.operator("pet.grow_selection_plane_aware", text="Grow -")
+                # Grow button (medium strength)
                 edit_row.operator("pet.grow_selection_boundary_aware", text="Grow")
+                # Grow + button (strongest)
                 edit_row.operator("pet.grow_selection", text="Grow +")
                 edit_row.operator("pet.shrink_selection", text="Shrink -")
                 

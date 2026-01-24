@@ -3,6 +3,7 @@ from bpy.types import Operator
 from bpy.props import StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty
 import bmesh
 import time
+import math
 
 from ..utils.spatial_selection import fill_gaps_aggressive
 
@@ -366,6 +367,151 @@ class PET_OT_grow_selection_boundary_aware(Operator):
             self.report({'INFO'}, f"Grew selection by {added:,} vertices (total {len(final_selection):,})")
         else:
             self.report({'INFO'}, "No additional vertices added (blocked by boundaries or vertex groups)")
+        
+        return {'FINISHED'}
+
+
+class PET_OT_grow_selection_plane_aware(Operator):
+    """
+    Grow selection by one ring, respecting face planes and preventing growth
+    across perpendicular faces (90-degree transitions).
+    
+    This is a weaker alternative to "Grow" that:
+    - Only grows one ring (one edge hop)
+    - Blocks growth across perpendicular faces (~70-90° dihedral angle)
+    - Allows growth along same plane (< 70° dihedral angle)
+    - Respects vertex group assignments
+    - Respects boundary edges if pet_separation_boundary_edges exists
+    """
+    bl_idname = "pet.grow_selection_plane_aware"
+    bl_label = "Grow Selection (Plane Aware)"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    perpendicular_threshold: FloatProperty(
+        name="Perpendicular Threshold",
+        description="Angle threshold in degrees - edges with face angles above this are blocked",
+        default=70.0,
+        min=45.0,
+        max=90.0,
+        subtype='ANGLE'
+    )
+    
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH' or obj.mode != 'EDIT':
+            self.report({'ERROR'}, "Must be in Edit mode on a mesh")
+            return {'CANCELLED'}
+        
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        
+        # Get current selection
+        base_selection = {v.index for v in bm.verts if v.select}
+        if not base_selection:
+            self.report({'WARNING'}, "No vertices selected")
+            bmesh.update_edit_mesh(mesh)
+            return {'CANCELLED'}
+        
+        # Build exclusion set
+        excluded = set()
+        boundary_edge_indices = set()
+        
+        # Get current part from manual part selection state
+        state = getattr(context.scene, "pet_manual_part_selection_state", None)
+        current_part = getattr(state, "current_part", "") if state and getattr(state, "is_active", False) else ""
+        
+        # Vertex group exclusion (using mesh.vertices, NOT bm.verts)
+        if current_part and obj.vertex_groups:
+            for vg in obj.vertex_groups:
+                if vg.name == current_part:
+                    continue
+                vg_index = vg.index
+                for v in mesh.vertices:
+                    # Never exclude vertices the user has explicitly selected
+                    if v.index in base_selection:
+                        continue
+                    for g in v.groups:
+                        if g.group == vg_index and g.weight > 0.5:
+                            excluded.add(v.index)
+                            break
+        
+        # Boundary edge identification (if pet_separation_boundary_edges exists)
+        stored_boundaries = obj.get("pet_separation_boundary_edges", None)
+        if stored_boundaries and len(stored_boundaries) > 0:
+            # Build spatial index from stored boundaries
+            spatial_index = build_spatial_index(stored_boundaries, tolerance=0.001)
+            
+            if spatial_index:
+                # Find edges that match stored boundary coordinates
+                for edge in bm.edges:
+                    v1_co = edge.verts[0].co
+                    v2_co = edge.verts[1].co
+                    
+                    # Check if BOTH vertices are in the stored boundary data
+                    v1_match = coord_in_spatial_index(v1_co, spatial_index, tolerance=0.001)
+                    v2_match = coord_in_spatial_index(v2_co, spatial_index, tolerance=0.001)
+                    
+                    if v1_match and v2_match:
+                        boundary_edge_indices.add(edge.index)
+                        # Add both vertices to excluded to prevent growing across boundary
+                        excluded.add(edge.verts[0].index)
+                        excluded.add(edge.verts[1].index)
+        
+        # Convert threshold to radians for angle comparison
+        threshold_rad = math.radians(self.perpendicular_threshold)
+        
+        # Grow selection (single ring) with plane awareness
+        new_selection = set()
+        for vert_idx in base_selection:
+            vert = bm.verts[vert_idx]
+            for edge in vert.link_edges:
+                # Skip if this is a boundary edge
+                if edge.index in boundary_edge_indices:
+                    continue
+                
+                # Check for perpendicular faces (plane awareness)
+                # Only check edges with exactly 2 faces (manifold edges)
+                if len(edge.link_faces) == 2:
+                    try:
+                        f1, f2 = edge.link_faces
+                        # Calculate dihedral angle between face normals
+                        angle = f1.normal.angle(f2.normal)
+                        
+                        # If angle exceeds threshold, this is a perpendicular transition - block growth
+                        if angle > threshold_rad:
+                            continue  # Skip this edge
+                    except (ValueError, AttributeError):
+                        # If we can't calculate angle, allow growth (fallback)
+                        pass
+                # For boundary edges (1 face) or non-manifold (0 or 3+ faces), 
+                # we allow growth (boundary edges are already excluded above)
+                
+                other_vert = edge.other_vert(vert)
+                # Only add if not excluded
+                if other_vert.index not in excluded:
+                    new_selection.add(other_vert.index)
+        
+        # Final selection (union to preserve original selection)
+        final_selection = base_selection.union(new_selection)
+        
+        # Apply selection
+        for v in bm.verts:
+            v.select = v.index in final_selection
+        
+        bmesh.update_edit_mesh(mesh)
+        
+        # If manual part selection is active, keep its selection count in sync
+        if state is not None and getattr(state, "is_active", False):
+            state.current_selection_vertex_count = len(final_selection)
+        
+        added = len(final_selection) - len(base_selection)
+        if added > 0:
+            self.report({'INFO'}, f"Grew selection by {added:,} vertices (total {len(final_selection):,})")
+        else:
+            self.report({'INFO'}, "No additional vertices added (blocked by perpendicular faces, boundaries, or vertex groups)")
         
         return {'FINISHED'}
 
@@ -903,6 +1049,7 @@ classes = [
     PET_OT_select_segment,
     PET_OT_grow_selection,
     PET_OT_grow_selection_boundary_aware,
+    PET_OT_grow_selection_plane_aware,
     PET_OT_shrink_selection,
     PET_OT_smooth_selection_boundary,
     PET_OT_fill_gaps_selection,
