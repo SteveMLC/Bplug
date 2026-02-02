@@ -4,8 +4,11 @@ Helper functions for working with bmesh in the addon
 """
 
 import bmesh
+import bpy
 from mathutils import Vector
+
 from . import segmentation_refinement
+from .orientation import auto_invert_forward_axis
 
 
 def get_mesh_bounds(obj):
@@ -35,6 +38,147 @@ def get_mesh_bounds(obj):
     size = max_bbox - min_bbox
     
     return min_bbox, max_bbox, size
+
+
+def adaptive_timeout(vertex_count: int, base: float = 5.0, per_100k: float = 2.0, max_timeout: float = 20.0) -> float:
+    """Adaptive timeout to avoid penalizing large meshes.
+
+    Geometry-based operations on 500k+ vertex meshes routinely exceed a fixed 5s timeout.
+    """
+    return min(max_timeout, base + per_100k * (vertex_count / 100_000.0))
+
+
+def validate_segmentation(vertex_groups: dict, *, expected_parts=None, min_parts: int = 2, min_body_ratio: float = 0.25) -> bool:
+    """Best-effort validation so we don't accept obvious garbage results."""
+    if not vertex_groups or len(vertex_groups) < min_parts:
+        return False
+
+    if any(not indices for indices in vertex_groups.values()):
+        return False
+
+    if expected_parts:
+        # At minimum, body+head is a reasonable baseline for animals.
+        if 'body' in expected_parts and 'body' not in vertex_groups:
+            return False
+        if 'head' in expected_parts and 'head' not in vertex_groups:
+            return False
+
+    total = sum(len(v) for v in vertex_groups.values())
+    if total <= 0:
+        return False
+
+    if 'body' in vertex_groups:
+        if (len(vertex_groups['body']) / total) < min_body_ratio:
+            return False
+
+    return True
+
+
+def segment_by_regions_robust(
+    obj,
+    template,
+    use_connectivity_refinement=True,
+    sensitivity=0.5,
+    auto_detect_protrusions=True,
+    use_geometry_based=True,
+    template_type='quadruped',
+    use_fast_mode=False,
+    timeout=None,
+    invert_forward_axis=False,
+    auto_orientation=True,
+):
+    """Robust segmentation entry point.
+
+    Strategy chain (never fail completely):
+      geometry-based → fast-mode → spatial(+refine if allowed) → spatial-basic
+
+    Returns:
+        (vertex_groups_created, method_name)
+    """
+    if not obj or obj.type != 'MESH':
+        return {}, 'invalid-object'
+
+    vcount = len(obj.data.vertices)
+    expected_parts = set(template.keys()) if template else None
+
+    # Auto-orientation: compute a likely invert flag unless the user explicitly asks to invert.
+    effective_invert = bool(invert_forward_axis)
+    if auto_orientation and not invert_forward_axis:
+        try:
+            effective_invert = auto_invert_forward_axis(obj)
+            obj['pet_auto_invert_forward_axis'] = bool(effective_invert)
+        except Exception:
+            # Orientation detection is best-effort.
+            effective_invert = bool(invert_forward_axis)
+
+    base_timeout = timeout if timeout is not None else adaptive_timeout(vcount)
+
+    # When a user selects "Fast Mode" explicitly, don't waste time attempting heavy strategies.
+    strategies = []
+    if use_geometry_based and not use_fast_mode:
+        strategies.append(dict(
+            name='geometry',
+            use_geometry_based=True,
+            use_fast_mode=False,
+            use_connectivity_refinement=use_connectivity_refinement,
+            auto_detect_protrusions=auto_detect_protrusions,
+            timeout=base_timeout,
+        ))
+
+    # Geometry fast: disable expensive refinement/protrusions.
+    if use_geometry_based:
+        strategies.append(dict(
+            name='geometry-fast',
+            use_geometry_based=True,
+            use_fast_mode=True,
+            use_connectivity_refinement=False,
+            auto_detect_protrusions=False,
+            timeout=max(5.0, base_timeout * 0.6),
+        ))
+
+    # Spatial fallback(s)
+    strategies.append(dict(
+        name='spatial',
+        use_geometry_based=False,
+        use_fast_mode=use_fast_mode,
+        use_connectivity_refinement=use_connectivity_refinement and not use_fast_mode,
+        auto_detect_protrusions=auto_detect_protrusions and not use_fast_mode,
+        timeout=max(5.0, base_timeout * 0.5),
+    ))
+    strategies.append(dict(
+        name='spatial-basic',
+        use_geometry_based=False,
+        use_fast_mode=True,
+        use_connectivity_refinement=False,
+        auto_detect_protrusions=False,
+        timeout=5.0,
+    ))
+
+    last_exc = None
+    for s in strategies:
+        try:
+            vg = segment_by_regions(
+                obj,
+                template,
+                use_connectivity_refinement=s['use_connectivity_refinement'],
+                sensitivity=sensitivity,
+                auto_detect_protrusions=s['auto_detect_protrusions'],
+                use_geometry_based=s['use_geometry_based'],
+                template_type=template_type,
+                use_fast_mode=s['use_fast_mode'],
+                timeout=s.get('timeout'),
+                invert_forward_axis=effective_invert,
+            )
+            if validate_segmentation(vg, expected_parts=expected_parts):
+                return vg, s['name']
+        except Exception as e:
+            last_exc = e
+            continue
+
+    # Absolute fallback: return empty (manual mode can still proceed).
+    if last_exc:
+        print(f"[Segmentation] All strategies failed: {last_exc}")
+    return {}, 'manual'
 
 
 def segment_by_regions(obj, template, use_connectivity_refinement=True, sensitivity=0.5, 

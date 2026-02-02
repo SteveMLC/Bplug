@@ -127,34 +127,20 @@ class PET_OT_segment_model(Operator):
             effective_connectivity = use_connectivity_refinement and not use_fast_mode
             effective_auto_detect = auto_detect_protrusions and not use_fast_mode
             
-            vertex_groups = None
-            try:
-                vertex_groups = bmesh_helpers.segment_by_regions(
-                    obj, 
-                    template,
-                    use_connectivity_refinement=effective_connectivity,
-                    sensitivity=sensitivity,
-                    auto_detect_protrusions=effective_auto_detect,
-                    use_geometry_based=use_geometry_based,
-                    template_type=pet_type,
-                    use_fast_mode=use_fast_mode,
-                    timeout=5.0,  # 5 second timeout for final segmentation
-                    invert_forward_axis=invert_forward_axis
-                )
-            except Exception as e:
-                print(f"WARNING: Segmentation failed ({str(e)}), falling back to spatial-only...")
-                # Fallback to spatial-only
-                vertex_groups = bmesh_helpers.segment_by_regions(
-                    obj, 
-                    template,
-                    use_connectivity_refinement=False,
-                    sensitivity=sensitivity,
-                    auto_detect_protrusions=False,
-                    use_geometry_based=False,
-                    template_type=pet_type,
-                    use_fast_mode=True,
-                    invert_forward_axis=invert_forward_axis
-                )
+            # Robust segmentation chain (never fail completely)
+            vertex_groups, method_used = bmesh_helpers.segment_by_regions_robust(
+                obj,
+                template,
+                use_connectivity_refinement=effective_connectivity,
+                sensitivity=sensitivity,
+                auto_detect_protrusions=effective_auto_detect,
+                use_geometry_based=use_geometry_based,
+                template_type=pet_type,
+                use_fast_mode=use_fast_mode,
+                timeout=None,  # adaptive in helper
+                invert_forward_axis=invert_forward_axis,  # user override only
+                auto_orientation=True,
+            )
             
             # Check elapsed time
             elapsed = time.time() - start_time
@@ -171,7 +157,6 @@ class PET_OT_segment_model(Operator):
                 total_vertices += len(indices)
             
             # Store results for UI display
-            method_used = "geometry-based" if use_geometry_based else "spatial-only"
             self.report(
                 {'INFO'},
                 f"Segmented into {len(vertex_groups)} parts ({method_used}): {', '.join(vertex_groups.keys())}"
@@ -181,6 +166,7 @@ class PET_OT_segment_model(Operator):
             obj["pet_segmentation_parts"] = len(vertex_groups)
             obj["pet_segmentation_vertices"] = total_vertices
             obj["pet_segmentation_time"] = processing_time
+            obj["pet_segmentation_method"] = method_used
             obj["pet_segmentation_timestamp"] = time.time()
             
             # Update mesh
