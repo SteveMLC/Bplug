@@ -10,6 +10,44 @@ from bpy.props import IntProperty, BoolProperty, FloatProperty
 from mathutils import Vector
 
 
+def _expand_vert_band(bm, seed_verts, steps):
+    """Return a set of verts expanded by `steps` rings over edges."""
+    if steps <= 0:
+        return set(seed_verts)
+
+    band = set(seed_verts)
+    frontier = set(seed_verts)
+    for _ in range(steps):
+        new_frontier = set()
+        for v in frontier:
+            for e in v.link_edges:
+                ov = e.other_vert(v)
+                if ov not in band:
+                    band.add(ov)
+                    new_frontier.add(ov)
+        frontier = new_frontier
+        if not frontier:
+            break
+    return band
+
+
+def _clamp_displacement(bm, original_pos, max_disp):
+    if max_disp is None or max_disp <= 0:
+        return
+
+    bm.verts.ensure_lookup_table()
+    for vidx, orig in original_pos.items():
+        if vidx >= len(bm.verts):
+            continue
+        v = bm.verts[vidx]
+        d = v.co - orig
+        if d.length > max_disp:
+            if d.length > 1e-12:
+                v.co = orig + d.normalized() * max_disp
+            else:
+                v.co = orig
+
+
 def build_spatial_index(stored_boundaries, tolerance=0.001):
     """
     Build a spatial index from stored boundary coordinates for O(n) lookup.
@@ -267,25 +305,43 @@ class PET_OT_smooth_cut_edges(Operator):
     
     iterations: IntProperty(
         name="Iterations",
-        description="Number of smoothing iterations. Each iteration applies one smoothing pass. More iterations = smoother result but may over-smooth details. Recommended: 2-4 for cut boundaries",
+        description="Number of smoothing iterations. Each iteration applies one smoothing pass.",
         default=2,
         min=1,
-        max=10
+        max=10,
     )
-    
-    smooth_factor: bpy.props.FloatProperty(
+
+    smooth_factor: FloatProperty(
         name="Smooth Factor",
-        description="Strength of smoothing per iteration (0.0 = no smoothing, 1.0 = full smoothing). Values between blend original position with smoothed position. Formula: new_pos = original * (1 - factor) + smoothed * factor",
-        default=1.0,
+        description="Strength of smoothing per iteration (0.0 = no smoothing, 1.0 = full smoothing)",
+        default=0.5,
         min=0.0,
         max=1.0,
-        subtype='FACTOR'
+        subtype='FACTOR',
     )
-    
+
     only_boundary: BoolProperty(
         name="Only Boundary Edges",
-        description="Only smooth edges that are on boundaries (edges with only one face). When enabled, only actual cut boundaries are smoothed. When disabled, all edges are smoothed (not recommended)",
-        default=True
+        description="Only smooth edges that are on boundaries (recommended)",
+        default=True,
+    )
+
+    boundary_band_steps: IntProperty(
+        name="Boundary Band",
+        description="Expand smoothing selection by this many vertex rings from the boundary",
+        default=1,
+        min=0,
+        max=6,
+    )
+
+    max_vertex_displacement: FloatProperty(
+        name="Max Displacement",
+        description="Clamp how far smoothed vertices can move (0 = unlimited)",
+        default=0.0,
+        min=0.0,
+        max=10.0,
+        step=0.01,
+        precision=4,
     )
     
     def execute(self, context):
@@ -295,6 +351,21 @@ class PET_OT_smooth_cut_edges(Operator):
             self.report({'ERROR'}, "Please select mesh objects with cut edges to smooth")
             return {'CANCELLED'}
         
+        # Prefer Scene settings (persistent UI). Fall back to operator props for backwards compatibility.
+        try:
+            settings = context.scene.pet_edge_cleanup_settings
+            iterations = getattr(settings, 'iterations', self.iterations)
+            smooth_factor = getattr(settings, 'smooth_factor', self.smooth_factor)
+            only_boundary = getattr(settings, 'only_boundary', self.only_boundary)
+            boundary_band_steps = getattr(settings, 'boundary_band_steps', self.boundary_band_steps)
+            max_vertex_displacement = getattr(settings, 'max_vertex_displacement', self.max_vertex_displacement)
+        except Exception:
+            iterations = self.iterations
+            smooth_factor = self.smooth_factor
+            only_boundary = self.only_boundary
+            boundary_band_steps = self.boundary_band_steps
+            max_vertex_displacement = self.max_vertex_displacement
+
         total_edges_smoothed = 0
         processed_objects = 0
         
@@ -330,44 +401,59 @@ class PET_OT_smooth_cut_edges(Operator):
             boundary_edges = list(separation_edges)
             for edge in boundary_edges:
                 edge.select = True
-            
+
             # If not only_boundary, also select all other edges
-            if not self.only_boundary:
+            if not only_boundary:
                 for edge in bm.edges:
                     if edge not in separation_edges:
                         edge.select = True
                         if edge not in boundary_edges:
                             boundary_edges.append(edge)
-            
+
             if not boundary_edges:
                 bmesh.update_edit_mesh(obj.data)
                 bm.free()
                 bpy.ops.object.mode_set(mode='OBJECT')
                 continue
-            
+
             total_edges_smoothed += len(boundary_edges)
-            
+
+            # Build boundary vertex band selection
+            boundary_verts = set()
+            for e in boundary_edges:
+                boundary_verts.update(e.verts)
+
+            band_verts = _expand_vert_band(bm, boundary_verts, boundary_band_steps)
+
+            # Store original positions for constraints
+            original_pos = {v.index: v.co.copy() for v in band_verts}
+
+            # Select the band verts (not just boundary edges)
+            for v in bm.verts:
+                v.select = False
+            for v in band_verts:
+                v.select = True
+
             # Update edit mesh with selection
             bmesh.update_edit_mesh(obj.data)
             bm.free()
-            
+
             # Apply smoothing iterations
-            for i in range(self.iterations):
-                # Use Blender's smooth operator
-                # This smooths selected edges/vertices
-                try:
-                    bpy.ops.mesh.vertices_smooth(
-                        factor=self.smooth_factor,
-                        repeat=1
-                    )
-                except RuntimeError:
-                    # If vertices_smooth fails, try alternative method
-                    bpy.ops.mesh.select_mode(type='VERT')
-                    bpy.ops.mesh.vertices_smooth(
-                        factor=self.smooth_factor,
-                        repeat=1
-                    )
-                    bpy.ops.mesh.select_mode(type='EDGE')
+            bpy.ops.mesh.select_mode(type='VERT')
+            for _ in range(iterations):
+                bpy.ops.mesh.vertices_smooth(
+                    factor=smooth_factor,
+                    repeat=1,
+                )
+
+            # Re-acquire bmesh for displacement constraints
+            bm2 = bmesh.from_edit_mesh(obj.data)
+            bm2.verts.ensure_lookup_table()
+            _clamp_displacement(bm2, original_pos, max_vertex_displacement)
+            bmesh.update_edit_mesh(obj.data)
+            bm2.free()
+
+            bpy.ops.mesh.select_mode(type='EDGE')
             
             # Return to object mode
             bpy.ops.object.mode_set(mode='OBJECT')

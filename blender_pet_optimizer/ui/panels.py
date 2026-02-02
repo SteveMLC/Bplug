@@ -197,6 +197,51 @@ class PET_SplitSettings(PropertyGroup):
     )
 
 
+class PET_EdgeCleanupSettings(PropertyGroup):
+    """PropertyGroup for edge cleanup settings stored on Scene"""
+
+    iterations: IntProperty(
+        name="Iterations",
+        description="Number of smoothing passes",
+        default=2,
+        min=1,
+        max=10,
+    )
+
+    smooth_factor: FloatProperty(
+        name="Smooth Factor",
+        description="Strength of smoothing per iteration (0.0 = no smoothing, 1.0 = full smoothing).",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+    )
+
+    only_boundary: BoolProperty(
+        name="Only Boundary Edges",
+        description="Only smooth edges on cut boundaries (recommended)",
+        default=True,
+    )
+
+    boundary_band_steps: IntProperty(
+        name="Boundary Band",
+        description="Expand smoothing selection by this many vertex rings from the boundary",
+        default=1,
+        min=0,
+        max=6,
+    )
+
+    max_vertex_displacement: FloatProperty(
+        name="Max Displacement",
+        description="Clamp how far smoothed vertices can move (0 = unlimited)",
+        default=0.0,
+        min=0.0,
+        max=10.0,
+        step=0.01,
+        precision=4,
+    )
+
+
 class PET_ManualAssignmentState(PropertyGroup):
     """PropertyGroup for manual assignment wizard state stored on Scene"""
     
@@ -1700,14 +1745,19 @@ class PET_PT_post_split_cleanup(Panel):
         if context.mode != 'OBJECT':
             edge_box.label(text="Switch to Object Mode", icon='INFO')
         else:
-            smooth_op = edge_box.operator("pet.smooth_cut_edges", text="Smooth Cut Edges", icon='BRUSH_DATA')
-            edge_box.prop(smooth_op, "iterations")
-            edge_box.prop(smooth_op, "smooth_factor", slider=True)
-            edge_box.prop(smooth_op, "only_boundary")
-            
+            ec = context.scene.pet_edge_cleanup_settings
+
+            edge_box.prop(ec, "iterations")
+            edge_box.prop(ec, "smooth_factor", slider=True)
+            edge_box.prop(ec, "only_boundary")
+            edge_box.prop(ec, "boundary_band_steps")
+            edge_box.prop(ec, "max_vertex_displacement")
+
+            edge_box.operator("pet.smooth_cut_edges", text="Smooth Cut Edges", icon='BRUSH_DATA')
+
             edge_box.separator()
             edge_box.operator("pet.select_cut_boundaries", text="Select Cut Boundaries", icon='RESTRICT_SELECT_OFF')
-            edge_box.label(text="Manually select edges, then smooth", icon='INFO')
+            edge_box.label(text="Tip: boundary band improves seam quality", icon='INFO')
         
         layout.separator()
         
@@ -2238,6 +2288,7 @@ def register():
     bpy.types.Scene.pet_pre_optimization_settings = bpy.props.PointerProperty(type=PET_PreOptimizationSettings)
     bpy.types.Scene.pet_post_split_optimization_settings = bpy.props.PointerProperty(type=PET_PostSplitOptimizationSettings)
     bpy.types.Scene.pet_split_settings = bpy.props.PointerProperty(type=PET_SplitSettings)
+    bpy.types.Scene.pet_edge_cleanup_settings = bpy.props.PointerProperty(type=PET_EdgeCleanupSettings)
 
 def unregister():
     # Unregister Scene properties
@@ -2255,6 +2306,8 @@ def unregister():
         del bpy.types.Scene.pet_post_split_optimization_settings
     if hasattr(bpy.types.Scene, 'pet_split_settings'):
         del bpy.types.Scene.pet_split_settings
+    if hasattr(bpy.types.Scene, 'pet_edge_cleanup_settings'):
+        del bpy.types.Scene.pet_edge_cleanup_settings
     
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
