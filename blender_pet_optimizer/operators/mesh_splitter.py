@@ -706,13 +706,6 @@ class PET_OT_split_by_vertex_groups(Operator):
                     stored_body_boundaries=stored_body_boundaries if vg.name not in body_names else None
                 )
                 
-                # CRITICAL: Identify separation boundary edges BEFORE splitting
-                # These are edges that connect vertices from different vertex groups
-                # They will become the cut boundaries after separation
-                separation_boundary_edges = self._identify_separation_boundary_edges(
-                    bm, vertex_mask, vg.name
-                )
-                
                 # Build exclusion set for other vertex groups to prevent bleeding
                 other_group_vertices = set()
                 vg_index = original_obj.vertex_groups.find(vg.name)
@@ -726,6 +719,21 @@ class PET_OT_split_by_vertex_groups(Operator):
                                 if group.group == other_vg_index and group.weight > 0.5:
                                     other_group_vertices.add(vertex.index)
                                     break
+
+                # Phase-1 boundary regularization: reduce jagged cut boundaries before separating
+                vertex_mask = self._regularize_vertex_mask_boundary(
+                    bm,
+                    vertex_mask,
+                    excluded_indices=other_group_vertices,
+                    iterations=2,
+                )
+
+                # CRITICAL: Identify separation boundary edges BEFORE splitting
+                # These are edges that connect vertices from different vertex groups
+                # They will become the cut boundaries after separation
+                separation_boundary_edges = self._identify_separation_boundary_edges(
+                    bm, vertex_mask, vg.name
+                )
                 
                 # SELECT LINKED APPROACH: Start with vertex group vertices,
                 # select all connected geometry, then only exclude clear boundaries
@@ -1415,6 +1423,69 @@ class PET_OT_split_by_vertex_groups(Operator):
         
         return len(selected_faces)
     
+    def _regularize_vertex_mask_boundary(self, bm, vertex_mask, *, excluded_indices=None, iterations=2, include_thresh=0.6, exclude_thresh=0.4):
+        """Regularize a boolean vertex mask by smoothing only the boundary.
+
+        This reduces jagged, noisy cut boundaries by applying a simple neighbor-majority
+        vote on boundary vertices. It is intentionally conservative and respects
+        excluded_indices (vertices belonging to other groups).
+        """
+        if not vertex_mask:
+            return vertex_mask
+
+        excluded_indices = excluded_indices or set()
+        bm.verts.ensure_lookup_table()
+
+        mask = list(vertex_mask)
+        for _ in range(max(0, iterations)):
+            boundary = []
+            for v in bm.verts:
+                i = v.index
+                if i in excluded_indices:
+                    continue
+                in_group = mask[i]
+                # Boundary if it has a neighbor with differing membership
+                for e in v.link_edges:
+                    j = e.other_vert(v).index
+                    if j >= len(mask):
+                        continue
+                    if mask[j] != in_group:
+                        boundary.append(i)
+                        break
+
+            if not boundary:
+                break
+
+            new_mask = list(mask)
+            for i in boundary:
+                v = bm.verts[i]
+                total = 0
+                inside = 0
+                for e in v.link_edges:
+                    j = e.other_vert(v).index
+                    if j >= len(mask) or j in excluded_indices:
+                        continue
+                    total += 1
+                    if mask[j]:
+                        inside += 1
+
+                if total == 0:
+                    continue
+                ratio = inside / total
+                if ratio >= include_thresh:
+                    new_mask[i] = True
+                elif ratio <= exclude_thresh:
+                    new_mask[i] = False
+
+            # Enforce exclusions
+            for i in excluded_indices:
+                if i < len(new_mask):
+                    new_mask[i] = False
+
+            mask = new_mask
+
+        return mask
+
     def _identify_separation_boundary_edges(self, bm, vertex_mask, vertex_group_name):
         """
         Identify edges that form the boundary between the vertex group being split and other groups.
